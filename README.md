@@ -109,10 +109,20 @@ redémarrage.
 | Pilotage | `control-socket` sur `/run/kea/kea4-ctrl-socket` |
 | Journalisation | `loggers` vers `/var/log/kea/kea-dhcp4.log`, avec rotation |
 
-> **Compatibilité de version.** Kea 2.3.6 a renommé `output_options` en
-> `output-options`. Le script lit la version installée avec `kea-dhcp4 -V` et
-> écrit le nom que cette version connaît : le même fichier de configuration
-> fonctionne sur Debian 12 (Kea 2.2) comme sur Debian 13 (Kea 2.6).
+> **Compatibilité de version.** La série Kea 2.6 a renommé `output_options` en
+> `output-options`, et la série 2.4 refuse encore le nouveau nom. Le script lit
+> la version installée avec `kea-dhcp4 -V` et écrit celui qu'elle connaît : le
+> même fichier fonctionne sur Debian 12 (Kea 2.2), Ubuntu 24.04 (Kea 2.4) et
+> Debian 13 (Kea 2.6). Si `kea-dhcp4 -t` rejette malgré tout ce nom, le
+> contrôle échange les deux et relance : une version inattendue ne bloque
+> plus l'installation.
+
+> **Écriture sûre.** Aucun fichier n'est écrit directement à sa place. Le
+> script génère à côté, vérifie que la marque de fin `dns-dhcp-auto:eof` est
+> présente — donc que la génération est allée jusqu'au bout — puis met en
+> place d'un seul `mv`. Une génération interrompue laisse la configuration
+> précédente intacte et arrête l'étape, au lieu de déposer un fichier tronqué
+> que seul le contrôle suivant découvrira.
 
 ### Mise à jour dynamique (DDNS)
 
@@ -371,6 +381,24 @@ sudo ss -lunp | grep :53                   # qui occupe deja le port
 La cause la plus fréquente est `systemd-resolved`, qui écoute déjà sur le
 port 53. Le champ `Utiliser ce DNS` du formulaire l'arrête et redirige
 `/etc/resolv.conf` vers le serveur local.
+
+### « Syntax check failed with: Unable to open file /etc/kea/kea-dhcp4.conf »
+
+`kea-dhcp4 -t` emploie ce message pour trois situations très différentes :
+fichier absent, fichier vide, fichier illisible. Le script tranche désormais
+lui-même avant d'appeler Kea et écrit dans son journal le motif exact, les
+droits du répertoire et la place disponible :
+
+```bash
+sudo ./manage-dns-dhcp.sh --check       # le motif, pas seulement l'échec
+sudo tail -n 40 /var/log/dns-dhcp-auto.log
+ls -l /etc/kea/
+```
+
+Si le fichier manque alors que l'étape « Configuration de Kea DHCP4 » s'est
+déclarée réussie, c'est une version antérieure du script : l'étape rendait 0
+sans jamais vérifier son propre travail. Relancez `--apply` avec cette
+version, qui échoue à l'écriture et nomme la cause.
 
 ### Kea refuse de démarrer
 

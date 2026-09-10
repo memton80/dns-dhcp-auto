@@ -61,6 +61,11 @@ KEA_VER=""
 # d'un administrateur.
 GEN_MARK="# --- genere par dns-dhcp-auto ---"
 
+# Derniere ligne de tout fichier genere. Sa presence prouve que l'ecriture est
+# allee jusqu'au bout : sans elle, on saurait qu'un fichier existe, jamais
+# qu'il est complet.
+GEN_END="dns-dhcp-auto:eof"
+
 export PATH="$PATH:/usr/sbin:/sbin:/usr/local/sbin"
 export DEBIAN_FRONTEND=noninteractive
 
@@ -127,16 +132,23 @@ detect_kea_version() {
     return 1
 }
 
-# Kea 2.3.6 a renomme "output_options" en "output-options". L'ancien nom reste
-# accepte plus tard, mais l'inverse n'est pas vrai : on ecrit celui que la
-# version installee connait a coup sur.
+# Kea a renomme "output_options" en "output-options" dans la serie 2.6 : la
+# serie 2.4 refuse encore le nouveau nom, la 2.6 accepte les deux. On ecrit
+# celui que la version installee connait a coup sur ; si la detection se
+# trompe malgre tout, do_check_dhcp echange les deux et recommence.
+KEA_OUTKEY_FORCE=""
+
 kea_output_key() {
     local maj=0 min=0
+    if [[ -n $KEA_OUTKEY_FORCE ]]; then
+        printf '%s' "$KEA_OUTKEY_FORCE"
+        return 0
+    fi
     if detect_kea_version; then
         maj=${KEA_VER%%.*}
         min=${KEA_VER##*.}
     fi
-    if (( maj > 2 || (maj == 2 && min >= 4) )); then
+    if (( maj > 2 || (maj == 2 && min >= 6) )); then
         printf 'output-options'
     else
         printf 'output_options'
@@ -3116,7 +3128,10 @@ step_skip() {
 # l'ecran principal pour corriger et relancer.
 die_step() {
     local msg=$1 tail_log
-    tail_log=$(tail -n 8 "$STEP_LOG" 2>/dev/null | cut -c1-72)
+    # Douze lignes : de quoi montrer a la fois le motif de l'echec et l'etat
+    # du chemin mis en cause, que les taches tracent desormais l'un apres
+    # l'autre.
+    tail_log=$(tail -n 12 "$STEP_LOG" 2>/dev/null | cut -c1-72)
     log_line "ECHEC : $msg (etape : ${STEP_LABEL:-?}, progression : ${PCT:-0}%)"
     if (( CLI_MODE )); then
         printf '%s\n' "$msg" >&2
@@ -3271,6 +3286,7 @@ do_backup() {
     if [[ -d $BIND_ZONE_DIR ]]; then
         mkdir -p "$dst/zones"
         cp -a "$BIND_ZONE_DIR"/. "$dst/zones/" 2>/dev/null
+        rm -f "$dst/zones"/*.dnsdhcp-*.tmp 2>/dev/null
     fi
     printf 'Sauvegarde dans %s\n' "$dst"
     # on ne garde que les 20 dernieres sauvegardes
@@ -3280,6 +3296,106 @@ do_backup() {
         rm -rf "$old"
     done < <(ls -1d "$BACKUP_DIR"/*/ 2>/dev/null | sort | head -n -20)
     return 0
+}
+
+#==============================================================================
+#  18 bis. ECRITURE SURE DES FICHIERS GENERES
+#
+#  Une redirection "{ ... } > fichier" ne rate que si le fichier ne peut pas
+#  etre ouvert. Si la generation s'arrete en cours de route, le shell rend
+#  quand meme 0 et laisse un fichier tronque, voire vide, a sa place : l'etape
+#  est declaree reussie et l'erreur ne remonte que bien plus tard, sous la
+#  forme deroutante d'un named-checkconf ou d'un kea-dhcp4 -t qui bute sur un
+#  fichier "introuvable". On ecrit donc toujours a cote, on verifie que la
+#  derniere ligne attendue est bien la, puis on met en place d'un seul coup.
+#==============================================================================
+
+# num_or <valeur> <defaut> : toute valeur qui part dans un calcul passe par
+# ici. Un champ vide couperait $(( )) et donc la generation, en plein milieu
+# du fichier.
+num_or() {
+    [[ $1 =~ ^[0-9]+$ ]] && { printf '%s' "$1"; return 0; }
+    printf '%s' "$2"
+}
+
+group_exists() {
+    getent group "$1" >/dev/null 2>&1 && return 0
+    grep -q "^$1:" /etc/group 2>/dev/null
+}
+
+user_exists() {
+    getent passwd "$1" >/dev/null 2>&1 && return 0
+    grep -q "^$1:" /etc/passwd 2>/dev/null
+}
+
+# Fichier de travail place dans le repertoire de destination : meme systeme de
+# fichiers, donc un mv reellement atomique.
+tmp_for() { printf '%s.dnsdhcp-%s.tmp' "$1" "$$"; }
+
+# publish_file <temporaire> <destination> <mode> [proprietaire]
+publish_file() {
+    local tmp=$1 dst=$2 mode=$3 owner=${4:-} last
+    if [[ ! -s $tmp ]]; then
+        printf "Generation vide : %s n'a pas ete ecrit\n" "$dst"
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+    last=$(tail -n 3 "$tmp" 2>/dev/null | tr -d '[:space:]')
+    if [[ $last != *"$GEN_END" ]]; then
+        printf "Generation interrompue : %s est incomplet, rien n'a ete remplace\n" "$dst"
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+    if [[ -d $dst ]]; then
+        # mv deposerait le fichier a l'interieur au lieu de remplacer.
+        printf '%s est un repertoire, pas un fichier de configuration\n' "$dst"
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+    chmod "$mode" "$tmp" 2>/dev/null
+    [[ -n $owner ]] && chown "$owner" "$tmp" 2>/dev/null
+    if ! mv -f "$tmp" "$dst" 2>&1; then
+        printf 'Mise en place impossible : %s\n' "$dst"
+        rm -f "$tmp" 2>/dev/null
+        return 1
+    fi
+    if [[ ! -s $dst || ! -r $dst ]]; then
+        printf "Apres ecriture, %s est absent, vide ou illisible\n" "$dst"
+        return 1
+    fi
+    return 0
+}
+
+# file_ready <fichier> : dit precisement ce qui manque avant d'appeler un
+# controleur de syntaxe, la ou l'outil se contente d'un "Unable to open file"
+# qui ne distingue pas absent, vide et illisible.
+file_ready() {
+    local f=$1
+    if [[ ! -e $f ]]; then printf '%s est absent\n' "$f"; return 1; fi
+    if [[ -d $f ]]; then printf '%s est un repertoire\n' "$f"; return 1; fi
+    if [[ ! -s $f ]]; then printf '%s est vide\n' "$f"; return 1; fi
+    if [[ ! -r $f ]]; then printf "%s n'est pas lisible\n" "$f"; return 1; fi
+    return 0
+}
+
+# report_path <fichier> : trace ce que le disque montre vraiment. Le journal
+# suffit alors a trancher entre droits, place libre et fichier jamais ecrit.
+report_path() {
+    local f=$1 d
+    d=$(dirname "$f")
+    printf 'Etat du chemin %s :\n' "$f"
+    ls -ld "$d" 2>&1 | sed 's/^/  /'
+    ls -l "$f" 2>&1 | sed 's/^/  /'
+    command -v df >/dev/null 2>&1 && df -h "$d" 2>/dev/null | tail -n 1 | sed 's/^/  /'
+    return 0
+}
+
+# ensure_dir <repertoire> : un mkdir qui explique son echec.
+ensure_dir() {
+    mkdir -p "$1" 2>/dev/null && return 0
+    printf 'Repertoire inaccessible : %s\n' "$1"
+    report_path "$1"
+    return 1
 }
 
 #==============================================================================
@@ -3342,7 +3458,8 @@ do_bind_options() {
     dnssec="no"; [[ ${VAL[dns_dnssec]} == oui ]] && dnssec="auto"
     v6="none"; [[ ${VAL[dns_listen6]} == oui ]] && v6="any"
 
-    mkdir -p "$BIND_DIR" || return 1
+    ensure_dir "$BIND_DIR" || return 1
+    local tmp; tmp=$(tmp_for "$BIND_OPTIONS")
     {
         printf '%s\n' "$GEN_MARK"
         printf '// %s\n\n' "$(date '+%F %T')"
@@ -3365,8 +3482,9 @@ do_bind_options() {
         fi
         printf '\n    auth-nxdomain no;\n'
         printf '};\n'
-    } >"$BIND_OPTIONS" || return 1
-    chmod 644 "$BIND_OPTIONS"
+        printf '// %s\n' "$GEN_END"
+    } >"$tmp" || { rm -f "$tmp" 2>/dev/null; report_path "$BIND_OPTIONS"; return 1; }
+    publish_file "$tmp" "$BIND_OPTIONS" 644 || { report_path "$BIND_OPTIONS"; return 1; }
     return 0
 }
 
@@ -3375,6 +3493,8 @@ do_bind_local() {
     local upd="none"
     [[ ${VAL[ddns_enable]} == oui ]] && upd="key \"${VAL[ddns_key]}\""
 
+    ensure_dir "$BIND_DIR" || return 1
+    local tmp; tmp=$(tmp_for "$BIND_LOCAL")
     {
         printf '%s\n' "$GEN_MARK"
         printf '// %s\n\n' "$(date '+%F %T')"
@@ -3422,8 +3542,9 @@ zone "$rev" {
 };
 EOF
         fi
-    } >"$BIND_LOCAL" || return 1
-    chmod 644 "$BIND_LOCAL"
+        printf '// %s\n' "$GEN_END"
+    } >"$tmp" || { rm -f "$tmp" 2>/dev/null; report_path "$BIND_LOCAL"; return 1; }
+    publish_file "$tmp" "$BIND_LOCAL" 644 || { report_path "$BIND_LOCAL"; return 1; }
 
     if [[ ${VAL[dns_logging]} == oui ]]; then
         mkdir -p "$BIND_LOGDIR"
@@ -3441,10 +3562,12 @@ do_zone_files() {
     local rfile="$BIND_ZONE_DIR/db.$rev"
     local serial name type value owner
 
-    mkdir -p "$BIND_ZONE_DIR" || return 1
+    ensure_dir "$BIND_ZONE_DIR" || return 1
+    local tmp
 
     if [[ ${VAL[dns_forward]} == oui ]]; then
         serial=$(next_serial "$ffile")
+        tmp=$(tmp_for "$ffile")
         {
             printf '; %s\n' "${GEN_MARK#\# }"
             printf '; %s\n' "$(date '+%F %T')"
@@ -3488,13 +3611,14 @@ do_zone_files() {
                     printf '%-15s IN  A       %s\n' "$name" "$value"
                 done
             fi
-        } >"$ffile" || return 1
-        chown root:bind "$ffile" 2>/dev/null
-        chmod 644 "$ffile"
+            printf '; %s\n' "$GEN_END"
+        } >"$tmp" || { rm -f "$tmp" 2>/dev/null; report_path "$ffile"; return 1; }
+        publish_file "$tmp" "$ffile" 644 root:bind || { report_path "$ffile"; return 1; }
     fi
 
     if [[ ${VAL[dns_reverse]} == oui && -n $rev ]]; then
         serial=$(next_serial "$rfile")
+        tmp=$(tmp_for "$rfile")
         {
             printf '; %s\n' "${GEN_MARK#\# }"
             printf '; %s\n' "$(date '+%F %T')"
@@ -3532,23 +3656,40 @@ do_zone_files() {
                     printf '%-11s IN  PTR     %s.%s.\n' "$owner" "$name" "$dom"
                 done
             fi
-        } >"$rfile" || return 1
-        chown root:bind "$rfile" 2>/dev/null
-        chmod 644 "$rfile"
+            printf '; %s\n' "$GEN_END"
+        } >"$tmp" || { rm -f "$tmp" 2>/dev/null; report_path "$rfile"; return 1; }
+        publish_file "$tmp" "$rfile" 644 root:bind || { report_path "$rfile"; return 1; }
     fi
 
     chown root:bind "$BIND_ZONE_DIR" 2>/dev/null
     return 0
 }
 
+# check_zone <zone> <fichier> : named-checkzone sur un fichier absent rend une
+# erreur laconique. On verifie donc le fichier d'abord.
+check_zone() {
+    local zone=$1 f=$2
+    if ! file_ready "$f"; then
+        report_path "$f"
+        return 1
+    fi
+    named-checkzone "$zone" "$f"
+}
+
 do_check_bind() {
     local rc=0
+    if ! command -v named-checkconf >/dev/null 2>&1; then
+        printf "named-checkconf est introuvable : BIND9 n'est pas installe\n"
+        return 1
+    fi
+    file_ready "$BIND_OPTIONS" || { report_path "$BIND_OPTIONS"; rc=1; }
+    file_ready "$BIND_LOCAL"   || { report_path "$BIND_LOCAL"; rc=1; }
     named-checkconf || rc=1
     if [[ ${VAL[dns_forward]} == oui ]]; then
-        named-checkzone "${VAL[domain]}" "$BIND_ZONE_DIR/db.${VAL[domain]}" || rc=1
+        check_zone "${VAL[domain]}" "$BIND_ZONE_DIR/db.${VAL[domain]}" || rc=1
     fi
     if [[ ${VAL[dns_reverse]} == oui && -n ${VAL[rev_zone]} ]]; then
-        named-checkzone "${VAL[rev_zone]}" "$BIND_ZONE_DIR/db.${VAL[rev_zone]}" || rc=1
+        check_zone "${VAL[rev_zone]}" "$BIND_ZONE_DIR/db.${VAL[rev_zone]}" || rc=1
     fi
     return $rc
 }
@@ -3609,6 +3750,7 @@ build_kea_options() {
         KEA_OPTS+=("{ \"name\": \"broadcast-address\", \"data\": \"${VAL[dhcp_bcast]}\" }")
     v=$(csv_list "${VAL[dhcp_ntp]}")
     [[ -n $v ]] && KEA_OPTS+=("{ \"name\": \"ntp-servers\", \"data\": \"$(json_esc "$v")\" }")
+    return 0
 }
 
 # Reservations d'adresses -> tableau KEA_RES
@@ -3621,11 +3763,22 @@ build_kea_reservations() {
         [[ -n $name && -n $mac && -n $ip ]] || continue
         KEA_RES+=("{ \"hw-address\": \"$mac\", \"ip-address\": \"$ip\", \"hostname\": \"$(json_esc "$name")\" }")
     done
+    return 0
 }
 
 do_kea_conf() {
-    local pfx pool okey
-    pfx=$(mask_to_prefix "${VAL[dhcp_mask]}")
+    local pfx pool okey lease maxlease tmp
+    # La version de Kea est lue une seule fois, hors substitution, pour que la
+    # mise en cache serve aussi aux appels suivants de cette etape.
+    detect_kea_version
+    # Chaque valeur qui part dans un calcul est bornee : un champ vide ferait
+    # echouer $(( )) et laisserait le fichier coupe en deux.
+    pfx=$(num_or "$(mask_to_prefix "${VAL[dhcp_mask]}")" 24)
+    (( pfx < 1 || pfx > 32 )) && pfx=24
+    lease=$(num_or "${VAL[dhcp_lease]}" 600)
+    (( lease < 60 )) && lease=60
+    maxlease=$(num_or "${VAL[dhcp_maxlease]}" 7200)
+    (( maxlease < lease )) && maxlease=$lease
     pool="${VAL[range_start]} - ${VAL[range_end]}"
     okey=$(kea_output_key)
 
@@ -3640,11 +3793,15 @@ do_kea_conf() {
     [[ ${VAL[dhcp_deny]} == oui ]] && \
         pool_line="{ \"pool\": \"$pool\", \"client-class\": \"KNOWN\" }"
 
-    mkdir -p "$KEA_DIR" || return 1
-    mkdir -p "$(dirname "$KEA_LEASES")" 2>/dev/null
-    mkdir -p "$KEA_LOGDIR" 2>/dev/null
-    chown _kea:_kea "$KEA_LOGDIR" "$(dirname "$KEA_LEASES")" 2>/dev/null
+    ensure_dir "$KEA_DIR" || return 1
+    ensure_dir "$(dirname "$KEA_LEASES")" || return 1
+    ensure_dir "$KEA_LOGDIR" || return 1
+    # Le service tourne sous _kea : baux et journaux doivent lui appartenir.
+    if user_exists _kea; then
+        chown _kea:_kea "$KEA_LOGDIR" "$(dirname "$KEA_LEASES")" 2>/dev/null
+    fi
 
+    tmp=$(tmp_for "$KEA_CONF")
     {
         printf '// %s\n' "${GEN_MARK#\# }"
         printf '// %s\n' "$(date '+%F %T')"
@@ -3665,10 +3822,10 @@ do_kea_conf() {
         printf '        "name": "%s"\n' "$KEA_LEASES"
         printf '    },\n\n'
 
-        printf '    "valid-lifetime": %s,\n' "${VAL[dhcp_lease]}"
-        printf '    "max-valid-lifetime": %s,\n' "${VAL[dhcp_maxlease]}"
-        printf '    "renew-timer": %s,\n' $(( ${VAL[dhcp_lease]} / 2 ))
-        printf '    "rebind-timer": %s,\n' $(( ${VAL[dhcp_lease]} * 7 / 8 ))
+        printf '    "valid-lifetime": %s,\n' "$lease"
+        printf '    "max-valid-lifetime": %s,\n' "$maxlease"
+        printf '    "renew-timer": %s,\n' "$(( lease / 2 ))"
+        printf '    "rebind-timer": %s,\n' "$(( lease * 7 / 8 ))"
         if [[ ${VAL[dhcp_auth]} == oui ]]; then
             printf '    "authoritative": true,\n'
         else
@@ -3727,8 +3884,12 @@ do_kea_conf() {
         printf '        }\n'
         printf '    ]\n'
         printf '}\n}\n'
-    } >"$KEA_CONF" || return 1
-    chmod 644 "$KEA_CONF"
+        printf '// %s\n' "$GEN_END"
+    } >"$tmp" || { rm -f "$tmp" 2>/dev/null; report_path "$KEA_CONF"; return 1; }
+
+    # Le fichier ne contient aucun secret, mais il doit rester lisible par
+    # _kea, sous lequel tourne kea-dhcp4.
+    publish_file "$tmp" "$KEA_CONF" 644 || { report_path "$KEA_CONF"; return 1; }
     return 0
 }
 
@@ -3754,7 +3915,8 @@ do_kea_ddns_conf() {
         rev+=("{ \"name\": \"${VAL[rev_zone]}.\", \"key-name\": \"${VAL[ddns_key]}\", \"dns-servers\": [ { \"ip-address\": \"127.0.0.1\" } ] }")
     fi
 
-    mkdir -p "$KEA_DIR" || return 1
+    ensure_dir "$KEA_DIR" || return 1
+    local tmp; tmp=$(tmp_for "$KEA_D2_CONF")
     {
         printf '// %s\n' "${GEN_MARK#\# }"
         printf '// %s\n' "$(date '+%F %T')"
@@ -3788,16 +3950,57 @@ do_kea_ddns_conf() {
         printf '        }\n'
         printf '    ]\n'
         printf '}\n}\n'
-    } >"$KEA_D2_CONF" || return 1
-    chmod 640 "$KEA_D2_CONF"
-    chown root:_kea "$KEA_D2_CONF" 2>/dev/null
+        printf '// %s\n' "$GEN_END"
+    } >"$tmp" || { rm -f "$tmp" 2>/dev/null; report_path "$KEA_D2_CONF"; return 1; }
+
+    # Ce fichier porte le secret TSIG : lisible par _kea et par personne
+    # d'autre. Sans le groupe _kea, on se rabat sur root seul.
+    local d2mode=600 d2own=""
+    if group_exists _kea; then d2mode=640; d2own="root:_kea"; fi
+    publish_file "$tmp" "$KEA_D2_CONF" "$d2mode" "$d2own" || \
+        { report_path "$KEA_D2_CONF"; return 1; }
     return 0
 }
 
+# kea_check_one <binaire> <fichier> : controle de syntaxe explique.
+#
+# "Unable to open file" ne dit ni si le fichier manque, ni s'il est vide, ni
+# s'il est illisible : on regarde donc l'etat reel du chemin avant d'appeler
+# Kea, et on recopie sa sortie complete dans le journal de l'etape.
+kea_check_one() {
+    local bin=$1 conf=$2 out rc
+    if ! command -v "$bin" >/dev/null 2>&1; then
+        printf "%s est introuvable : le paquet Kea n'est pas installe\n" "$bin"
+        return 1
+    fi
+    if ! file_ready "$conf"; then
+        report_path "$conf"
+        return 1
+    fi
+    out=$("$bin" -t "$conf" 2>&1); rc=$?
+    if (( rc != 0 )); then
+        printf '%s\n' "$out"
+        # Seul un des deux noms du bloc de journalisation passe selon la
+        # version. Si c'est le seul reproche, on echange et on recommence :
+        # une detection de version un peu vieille ne bloque plus rien.
+        if [[ $out == *output-options* ]]; then
+            sed -i 's/"output-options"/"output_options"/' "$conf" 2>/dev/null
+        elif [[ $out == *output_options* ]]; then
+            sed -i 's/"output_options"/"output-options"/' "$conf" 2>/dev/null
+        else
+            return 1
+        fi
+        printf 'Nouvel essai avec l autre nom de bloc de journalisation\n'
+        out=$("$bin" -t "$conf" 2>&1); rc=$?
+        (( rc == 0 )) || printf '%s\n' "$out"
+    fi
+    return $rc
+}
+
 do_check_dhcp() {
-    kea-dhcp4 -t "$KEA_CONF" || return 1
+    kea_check_one kea-dhcp4 "$KEA_CONF" || return 1
     if [[ ${VAL[ddns_enable]} == oui ]] && command -v kea-dhcp-ddns >/dev/null 2>&1; then
-        kea-dhcp-ddns -t "$KEA_D2_CONF" || return 1
+        kea_check_one kea-dhcp-ddns "$KEA_D2_CONF" || return 1
     fi
     return 0
 }
@@ -4662,10 +4865,18 @@ diag_text() {
             fi
         fi
 
-        if [[ ${VAL[dhcp_enable]} == oui ]] && command -v kea-dhcp4 >/dev/null 2>&1 && [[ -f $KEA_CONF ]]; then
+        # Un diagnostic muet ne diagnostique rien : quand le DHCP est demande,
+        # cette section repond toujours, y compris pour dire ce qui manque.
+        if [[ ${VAL[dhcp_enable]} == oui ]]; then
             printf '\n%s\n' "$sep"
             printf '%s\n' "$L_DIAG_CHECK_DHCP"
-            kea-dhcp4 -t "$KEA_CONF" 2>&1 | tail -n 12
+            if ! command -v kea-dhcp4 >/dev/null 2>&1; then
+                printf '%s\n' "$L_CHECK_NO_DHCP"
+            elif ! file_ready "$KEA_CONF"; then
+                report_path "$KEA_CONF"
+            elif kea-dhcp4 -t "$KEA_CONF" 2>&1 | tail -n 12; then
+                printf '%s\n' "$L_DIAG_OK"
+            fi
         fi
 
         if command -v dig >/dev/null 2>&1 && [[ ${VAL[dns_enable]} == oui ]]; then
@@ -5220,13 +5431,16 @@ run_cli() {
             leases_text "$head"
             ;;
         check)
-            if [[ ${VAL[dns_enable]} == oui ]] && command -v named-checkconf >/dev/null 2>&1; then
+            # Les deux controles disent maintenant eux-memes ce qui manque,
+            # outil comme fichier : plus besoin de les court-circuiter, et un
+            # succes se voit au lieu de se deviner.
+            if [[ ${VAL[dns_enable]} == oui ]]; then
                 printf '%s\n' "$L_DIAG_CHECK_DNS"
-                do_check_bind || rc=1
+                if do_check_bind; then printf '%s\n' "$L_DIAG_OK"; else rc=1; fi
             fi
-            if [[ ${VAL[dhcp_enable]} == oui ]] && command -v kea-dhcp4 >/dev/null 2>&1; then
+            if [[ ${VAL[dhcp_enable]} == oui ]]; then
                 printf '%s\n' "$L_DIAG_CHECK_DHCP"
-                do_check_dhcp || rc=1
+                if do_check_dhcp; then printf '%s\n' "$L_DIAG_OK"; else rc=1; fi
             fi
             ;;
         backup)
@@ -5269,6 +5483,10 @@ run_cli() {
 cleanup() {
     (( CLI_MODE )) || tui_stop
     rm -f "$STEP_LOG" "$APT_STATUS" "$CONF_FILE.tmp" 2>/dev/null
+    # Une generation interrompue laisse son fichier de travail a cote de la
+    # destination : il n'a rien a faire dans /etc ni dans une sauvegarde.
+    rm -f "$BIND_DIR"/*.dnsdhcp-*.tmp "$BIND_ZONE_DIR"/*.dnsdhcp-*.tmp \
+          "$KEA_DIR"/*.dnsdhcp-*.tmp 2>/dev/null
 }
 
 quit_flow() {
