@@ -1,6 +1,6 @@
 #!/bin/bash
 #==============================================================================
-#  DNS-DHCP AUTO - Installation et gestion de BIND9 et d'ISC DHCP
+#  DNS-DHCP AUTO - Installation et gestion de BIND9 et de Kea DHCP4
 #
 #  Interface console maison (aucune dependance a whiptail / dialog) :
 #    - panneau "Machine et services" en haut a droite
@@ -36,16 +36,25 @@ BIND_LOCAL="/etc/bind/named.conf.local"
 BIND_LOGDIR="/var/log/named"
 DDNS_KEY_FILE="/etc/bind/ddns.key"
 
-DHCP_CONF="/etc/dhcp/dhcpd.conf"
-DHCP_DEFAULT="/etc/default/isc-dhcp-server"
-DHCP_LEASES="/var/lib/dhcp/dhcpd.leases"
+KEA_DIR="/etc/kea"
+KEA_CONF="/etc/kea/kea-dhcp4.conf"
+KEA_D2_CONF="/etc/kea/kea-dhcp-ddns.conf"
+KEA_LEASES="/var/lib/kea/kea-leases4.csv"
+KEA_LOGDIR="/var/log/kea"
+KEA_SOCKET="/run/kea/kea4-ctrl-socket"
+KEA_D2_PORT=53001
 
 UNINSTALL_PATH="./uninstall-dns-dhcp.sh"
 
 # Unites systemd, resolues au demarrage (Debian 12 expose "named" et son alias
 # "bind9", certaines images n'ont que l'un des deux).
 BIND_UNIT="named"
-DHCP_UNIT="isc-dhcp-server"
+DHCP_UNIT="kea-dhcp4-server"
+D2_UNIT="kea-dhcp-ddns-server"
+
+# Version de Kea, lue au premier besoin. Elle decide de quelques noms de
+# parametres qui ont change entre Kea 2.2 (Debian 12) et Kea 2.6 (Debian 13).
+KEA_VER=""
 
 # Marqueurs poses dans les fichiers generes : ils permettent de reconnaitre un
 # fichier ecrit par ce script et de ne jamais ecraser silencieusement celui
@@ -64,9 +73,9 @@ DIRTY=0                 # 1 = la configuration a change depuis le dernier apply
 # OS_CODENAME : "bookworm", "trixie"...
 # OS_LABEL    : libelle court affiche dans l'interface ("DEBIAN 12")
 #
-# La version compte : isc-dhcp-server n'est plus fourni par toutes les
-# distributions recentes, le script le verifie avant de proposer la partie
-# DHCP plutot que d'echouer au milieu de l'installation.
+# La version compte : Debian 12 livre Kea 2.2 et Debian 13 livre Kea 2.6, qui
+# n'acceptent pas exactement les memes noms de parametres. Le script s'adapte
+# a la version reellement installee plutot que de figer un seul format.
 OS_ID="debian"
 OS_VER=0
 OS_CODENAME=""
@@ -97,8 +106,40 @@ detect_units() {
     elif printf '%s\n' "$list" | grep -qx 'bind9.service'; then
         BIND_UNIT="bind9"
     fi
-    if printf '%s\n' "$list" | grep -qx 'isc-dhcp-server.service'; then
-        DHCP_UNIT="isc-dhcp-server"
+    if printf '%s\n' "$list" | grep -qx 'kea-dhcp4-server.service'; then
+        DHCP_UNIT="kea-dhcp4-server"
+    fi
+    if printf '%s\n' "$list" | grep -qx 'kea-dhcp-ddns-server.service'; then
+        D2_UNIT="kea-dhcp-ddns-server"
+    fi
+}
+
+# Version de Kea sous la forme "majeur.mineur", vide si Kea est absent.
+detect_kea_version() {
+    [[ -n $KEA_VER ]] && return 0
+    command -v kea-dhcp4 >/dev/null 2>&1 || return 1
+    local v
+    v=$(kea-dhcp4 -V 2>/dev/null | head -n1)
+    if [[ $v =~ ([0-9]+)\.([0-9]+) ]]; then
+        KEA_VER="${BASH_REMATCH[1]}.${BASH_REMATCH[2]}"
+        return 0
+    fi
+    return 1
+}
+
+# Kea 2.3.6 a renomme "output_options" en "output-options". L'ancien nom reste
+# accepte plus tard, mais l'inverse n'est pas vrai : on ecrit celui que la
+# version installee connait a coup sur.
+kea_output_key() {
+    local maj=0 min=0
+    if detect_kea_version; then
+        maj=${KEA_VER%%.*}
+        min=${KEA_VER##*.}
+    fi
+    if (( maj > 2 || (maj == 2 && min >= 4) )); then
+        printf 'output-options'
+    else
+        printf 'output_options'
     fi
 }
 
@@ -301,7 +342,7 @@ declare -a L_KEYS
 load_strings() {
     if [[ $UILANG == en ]]; then
         # ------------------------------------------------------------------ ENGLISH
-        L_APP_TITLE="DNS-DHCP AUTO - BIND9 AND ISC DHCP MANAGER"
+        L_APP_TITLE="DNS-DHCP AUTO - BIND9 AND KEA DHCP MANAGER"
         L_PANEL_CONFIG="Configuration"
         L_PANEL_STATE="Machine and services"
         L_PANEL_KEYS="Shortcuts"
@@ -320,7 +361,7 @@ load_strings() {
         L_M_FW="Firewall"
         L_M_DNS_SVC="BIND9"
         L_M_DNS_BOOT="BIND9 boot"
-        L_M_DHCP_SVC="ISC DHCP"
+        L_M_DHCP_SVC="Kea DHCP4"
         L_M_DHCP_BOOT="DHCP boot"
         L_M_P53="Port 53 DNS"
         L_M_P67="Port 67 DHCP"
@@ -352,7 +393,7 @@ load_strings() {
         L_SEC_SYS="SYSTEM"
         L_F_DNS_ON="Enable BIND9 (DNS)"
         L_H_DNS_ON="No: the DNS service is stopped and disabled at boot."
-        L_F_DHCP_ON="Enable ISC DHCP"
+        L_F_DHCP_ON="Enable Kea DHCP4"
         L_H_DHCP_ON="No: the DHCP service is stopped and disabled at boot."
         L_F_BOOT="Start at boot"
         L_H_BOOT="Starts the enabled services when the machine boots."
@@ -441,7 +482,7 @@ load_strings() {
         L_F_BOOTFILE="Boot file"
         L_H_BOOTFILE="Path of the file loaded over PXE, for example pxelinux.0."
         L_F_DDNS_ON="Dynamic updates"
-        L_H_DDNS_ON="The DHCP server registers the leases into the DNS zones itself."
+        L_H_DDNS_ON="The kea-dhcp-ddns daemon writes the leases into the DNS zones."
         L_F_DDNSKEY="Key name"
         L_H_DDNSKEY="Name of the key shared between BIND and the DHCP server."
         L_F_DDNSALGO="Algorithm"
@@ -546,12 +587,12 @@ load_strings() {
         L_S_APT_UPDATE="Updating the package list"
         L_S_APT_DNS="Installing BIND9"
         L_S_APT_DNS_SKIP="BIND9 already installed"
-        L_S_APT_DHCP="Installing ISC DHCP"
-        L_S_APT_DHCP_SKIP="ISC DHCP already installed"
+        L_S_APT_DHCP="Installing Kea DHCP4"
+        L_S_APT_DHCP_SKIP="Kea DHCP4 already installed"
         L_S_DONE="Done"
         L_E_APT_UPDATE="Updating the package list failed."
         L_E_APT_DNS="Installing BIND9 failed."
-        L_E_APT_DHCP="Installing ISC DHCP failed."
+        L_E_APT_DHCP="Installing Kea DHCP4 failed."
         L_S_BACKUP="Backing up the files in place"
         L_S_BACKUP_SKIP="Backup not requested"
         L_S_SAVECONF="Saving the configuration"
@@ -561,8 +602,8 @@ load_strings() {
         L_S_ZONES="Writing the zone files"
         L_S_CHECK_DNS="Checking the DNS configuration"
         L_S_DNS_SKIP="DNS disabled"
-        L_S_DHCP_CONF="DHCP server configuration"
-        L_S_DHCP_DEF="DHCP listening interface"
+        L_S_DHCP_CONF="Kea DHCP4 configuration"
+        L_S_DHCP_DEF="Dynamic update daemon"
         L_S_CHECK_DHCP="Checking the DHCP configuration"
         L_S_DHCP_SKIP="DHCP disabled"
         L_S_RESOLV="Machine name resolution"
@@ -577,9 +618,9 @@ load_strings() {
         L_E_BIND_LOCAL="Writing the zones into named.conf.local failed."
         L_E_ZONES="Writing the zone files failed."
         L_E_CHECK_DNS="The DNS configuration is rejected by named-checkconf."
-        L_E_DHCP_CONF="Writing dhcpd.conf failed."
-        L_E_DHCP_DEF="Writing the DHCP interface failed."
-        L_E_CHECK_DHCP="The DHCP configuration is rejected by dhcpd -t."
+        L_E_DHCP_CONF="Writing kea-dhcp4.conf failed."
+        L_E_DHCP_DEF="Writing kea-dhcp-ddns.conf failed."
+        L_E_CHECK_DHCP="The DHCP configuration is rejected by kea-dhcp4 -t."
         L_E_RESOLV="Changing /etc/resolv.conf failed."
         L_E_FIREWALL="Opening the firewall failed."
         L_E_SERVICES="A service did not start. See the diagnostics."
@@ -614,11 +655,11 @@ load_strings() {
         L_A_DNS_RELOAD="Reload the DNS zones"
         L_A_DNS_BOOT_ON="Enable BIND9 at boot"
         L_A_DNS_BOOT_OFF="Disable BIND9 at boot"
-        L_A_DHCP_START="Start ISC DHCP"
-        L_A_DHCP_STOP="Stop ISC DHCP"
-        L_A_DHCP_RESTART="Restart ISC DHCP"
-        L_A_DHCP_BOOT_ON="Enable ISC DHCP at boot"
-        L_A_DHCP_BOOT_OFF="Disable ISC DHCP at boot"
+        L_A_DHCP_START="Start Kea DHCP4"
+        L_A_DHCP_STOP="Stop Kea DHCP4"
+        L_A_DHCP_RESTART="Restart Kea DHCP4"
+        L_A_DHCP_BOOT_ON="Enable Kea DHCP4 at boot"
+        L_A_DHCP_BOOT_OFF="Disable Kea DHCP4 at boot"
         L_A_LEASES="Show the DHCP leases"
         L_A_RECORDS="Manage the DNS records"
         L_A_RESERV="Manage the DHCP reservations"
@@ -630,7 +671,7 @@ load_strings() {
         L_A_RESTORE="Restore a backup"
         L_A_DERIVE="Recompute from the network"
         L_A_RESET="Reset to the default values"
-        L_A_REMOVE="Uninstall BIND9 and ISC DHCP"
+        L_A_REMOVE="Uninstall BIND9 and Kea DHCP4"
         L_SVC_T="Service"
         L_SVC_ABSENT=$'Unit %s does not exist on this machine.\nIs the package installed?'
         L_SVC_OK="%s: %s done."
@@ -639,6 +680,8 @@ load_strings() {
         L_BOOT_OK="%s: %s at boot."
         L_LEASES_T="DHCP leases"
         L_LEASES_NONE="No lease recorded yet."
+        L_LEASE_ACTIVE="active"
+        L_LEASE_FREE="released"
         L_DIG_T="Resolution test"
         L_DIG_ASK="Name to resolve:"
         L_DIG_HINT="The query goes to the local server (127.0.0.1)."
@@ -646,6 +689,7 @@ load_strings() {
         L_DIAG_T="Diagnostics"
         L_DIAG_HEAD="MACHINE STATE"
         L_DIAG_SVC="SERVICES (package / state / boot)"
+        L_DIAG_UNITS="systemd units"
         L_DIAG_PORTS="LISTENING PORTS"
         L_DIAG_NOPORT="No service is listening on 53 or 67."
         L_DIAG_CHECK_DNS="DNS CONFIGURATION CHECK"
@@ -658,7 +702,7 @@ load_strings() {
         L_CHECK_T="Check"
         L_CHECK_RC="Exit code: %s"
         L_CHECK_NO_BIND="named-checkconf is missing: BIND9 is not installed."
-        L_CHECK_NO_DHCP="dhcpd is missing: ISC DHCP is not installed."
+        L_CHECK_NO_DHCP="kea-dhcp4 is missing: Kea is not installed."
         L_CHECK_NOTHING="No enabled service: nothing to check."
         L_FW_T="Firewall"
         L_FW_OPEN="Open the ports of the enabled services"
@@ -705,8 +749,8 @@ load_strings() {
         L_INSTALL_T="Installation"
         L_INSTALL_OK="The requested packages are installed."
         L_INSTALL_NOTHING="Nothing to install: everything is already there."
-        L_DHCP_MISSING_T="ISC DHCP unavailable"
-        L_DHCP_MISSING_B=$'The isc-dhcp-server package is not in this distribution\nrepositories: ISC DHCP reached end of life and was\nremoved after Debian 12.\n\nThe DNS side stays fully usable.\nFor DHCP, use Debian 12 or a Kea server.'
+        L_DHCP_MISSING_T="Kea DHCP4 unavailable"
+        L_DHCP_MISSING_B=$'The kea-dhcp4-server package is not in this\ndistribution repositories.\n\nThe DNS side stays fully usable. For DHCP, enable the\nrepository that carries Kea, or turn the DHCP part off.'
         L_DERIVE_T="Recompute"
         L_DERIVE_Q=$'Read the machine address, mask and gateway again\nand recompute the derived values?\n\nHand-typed values will be replaced.'
         L_DERIVE_OK="Values recomputed from the machine network."
@@ -714,9 +758,9 @@ load_strings() {
         L_RESET_Q=$'Reset the whole form to its default values?\n\nThe files already in place are left alone.'
         L_RESET_OK="Form reset."
         L_REMOVE_T="Uninstall"
-        L_REMOVE_Q=$'Remove the BIND9 and ISC DHCP configuration?\n\nThe services will be stopped and disabled.\nThe backups are kept.'
-        L_REMOVE_PURGE_Q="Also purge the bind9 and isc-dhcp-server packages?"
-        L_REMOVE_DONE="BIND9 and ISC DHCP have been removed from this machine."
+        L_REMOVE_Q=$'Remove the BIND9 and Kea DHCP4 configuration?\n\nThe services will be stopped and disabled.\nThe backups are kept.'
+        L_REMOVE_PURGE_Q="Also purge the bind9 and kea-dhcp4-server packages?"
+        L_REMOVE_DONE="BIND9 and Kea DHCP4 have been removed from this machine."
         L_SAVE_T="Saving"
         L_SAVE_OK="Configuration saved into %s"
         L_SAVE_KO="The configuration could not be written."
@@ -745,7 +789,7 @@ load_strings() {
         )
     else
         # ----------------------------------------------------------------- FRANCAIS
-        L_APP_TITLE="DNS-DHCP AUTO - GESTION BIND9 ET ISC DHCP"
+        L_APP_TITLE="DNS-DHCP AUTO - GESTION BIND9 ET KEA DHCP"
         L_PANEL_CONFIG="Configuration"
         L_PANEL_STATE="Machine et services"
         L_PANEL_KEYS="Raccourcis"
@@ -764,7 +808,7 @@ load_strings() {
         L_M_FW="Pare-feu"
         L_M_DNS_SVC="BIND9"
         L_M_DNS_BOOT="BIND9 boot"
-        L_M_DHCP_SVC="ISC DHCP"
+        L_M_DHCP_SVC="Kea DHCP4"
         L_M_DHCP_BOOT="DHCP boot"
         L_M_P53="Port 53 DNS"
         L_M_P67="Port 67 DHCP"
@@ -796,7 +840,7 @@ load_strings() {
         L_SEC_SYS="SYSTEME"
         L_F_DNS_ON="Activer BIND9 (DNS)"
         L_H_DNS_ON="Non : le service DNS est arrete et desactive au demarrage."
-        L_F_DHCP_ON="Activer ISC DHCP"
+        L_F_DHCP_ON="Activer Kea DHCP4"
         L_H_DHCP_ON="Non : le service DHCP est arrete et desactive au demarrage."
         L_F_BOOT="Demarrage automatique"
         L_H_BOOT="Lance les services actives au demarrage de la machine."
@@ -885,7 +929,7 @@ load_strings() {
         L_F_BOOTFILE="Fichier de demarrage"
         L_H_BOOTFILE="Chemin du fichier charge en PXE, par exemple pxelinux.0."
         L_F_DDNS_ON="Mise a jour dynamique"
-        L_H_DDNS_ON="Le serveur DHCP inscrit lui-meme les baux dans les zones DNS."
+        L_H_DDNS_ON="Le demon kea-dhcp-ddns inscrit les baux dans les zones DNS."
         L_F_DDNSKEY="Nom de la cle"
         L_H_DDNSKEY="Nom de la cle partagee entre BIND et le serveur DHCP."
         L_F_DDNSALGO="Algorithme"
@@ -990,12 +1034,12 @@ load_strings() {
         L_S_APT_UPDATE="Mise a jour de la liste des paquets"
         L_S_APT_DNS="Installation de BIND9"
         L_S_APT_DNS_SKIP="BIND9 deja installe"
-        L_S_APT_DHCP="Installation d'ISC DHCP"
-        L_S_APT_DHCP_SKIP="ISC DHCP deja installe"
+        L_S_APT_DHCP="Installation de Kea DHCP4"
+        L_S_APT_DHCP_SKIP="Kea DHCP4 deja installe"
         L_S_DONE="Termine"
         L_E_APT_UPDATE="La mise a jour de la liste des paquets a echoue."
         L_E_APT_DNS="L'installation de BIND9 a echoue."
-        L_E_APT_DHCP="L'installation d'ISC DHCP a echoue."
+        L_E_APT_DHCP="L'installation de Kea DHCP4 a echoue."
         L_S_BACKUP="Sauvegarde des fichiers en place"
         L_S_BACKUP_SKIP="Sauvegarde non demandee"
         L_S_SAVECONF="Enregistrement de la configuration"
@@ -1005,8 +1049,8 @@ load_strings() {
         L_S_ZONES="Ecriture des fichiers de zone"
         L_S_CHECK_DNS="Controle de la configuration DNS"
         L_S_DNS_SKIP="DNS desactive"
-        L_S_DHCP_CONF="Configuration du serveur DHCP"
-        L_S_DHCP_DEF="Interface d'ecoute DHCP"
+        L_S_DHCP_CONF="Configuration de Kea DHCP4"
+        L_S_DHCP_DEF="Demon de mise a jour dynamique"
         L_S_CHECK_DHCP="Controle de la configuration DHCP"
         L_S_DHCP_SKIP="DHCP desactive"
         L_S_RESOLV="Resolution de noms de la machine"
@@ -1021,9 +1065,9 @@ load_strings() {
         L_E_BIND_LOCAL="L'ecriture des zones dans named.conf.local a echoue."
         L_E_ZONES="L'ecriture des fichiers de zone a echoue."
         L_E_CHECK_DNS="La configuration DNS est refusee par named-checkconf."
-        L_E_DHCP_CONF="L'ecriture de dhcpd.conf a echoue."
-        L_E_DHCP_DEF="L'ecriture de l'interface DHCP a echoue."
-        L_E_CHECK_DHCP="La configuration DHCP est refusee par dhcpd -t."
+        L_E_DHCP_CONF="L'ecriture de kea-dhcp4.conf a echoue."
+        L_E_DHCP_DEF="L'ecriture de kea-dhcp-ddns.conf a echoue."
+        L_E_CHECK_DHCP="La configuration DHCP est refusee par kea-dhcp4 -t."
         L_E_RESOLV="La modification de /etc/resolv.conf a echoue."
         L_E_FIREWALL="L'ouverture du pare-feu a echoue."
         L_E_SERVICES="Un service n'a pas demarre. Voir le diagnostic."
@@ -1058,11 +1102,11 @@ load_strings() {
         L_A_DNS_RELOAD="Recharger les zones DNS"
         L_A_DNS_BOOT_ON="Activer BIND9 au demarrage"
         L_A_DNS_BOOT_OFF="Desactiver BIND9 au demarrage"
-        L_A_DHCP_START="Demarrer ISC DHCP"
-        L_A_DHCP_STOP="Arreter ISC DHCP"
-        L_A_DHCP_RESTART="Redemarrer ISC DHCP"
-        L_A_DHCP_BOOT_ON="Activer ISC DHCP au demarrage"
-        L_A_DHCP_BOOT_OFF="Desactiver ISC DHCP au demarrage"
+        L_A_DHCP_START="Demarrer Kea DHCP4"
+        L_A_DHCP_STOP="Arreter Kea DHCP4"
+        L_A_DHCP_RESTART="Redemarrer Kea DHCP4"
+        L_A_DHCP_BOOT_ON="Activer Kea DHCP4 au demarrage"
+        L_A_DHCP_BOOT_OFF="Desactiver Kea DHCP4 au demarrage"
         L_A_LEASES="Voir les baux DHCP"
         L_A_RECORDS="Gerer les enregistrements DNS"
         L_A_RESERV="Gerer les reservations DHCP"
@@ -1074,7 +1118,7 @@ load_strings() {
         L_A_RESTORE="Restaurer une sauvegarde"
         L_A_DERIVE="Recalculer depuis le reseau"
         L_A_RESET="Remettre les valeurs par defaut"
-        L_A_REMOVE="Desinstaller BIND9 et ISC DHCP"
+        L_A_REMOVE="Desinstaller BIND9 et Kea DHCP4"
         L_SVC_T="Service"
         L_SVC_ABSENT=$'L\'unite %s n\'existe pas sur cette machine.\nLe paquet est-il installe ?'
         L_SVC_OK="%s : %s effectue."
@@ -1083,6 +1127,8 @@ load_strings() {
         L_BOOT_OK="%s : %s au demarrage."
         L_LEASES_T="Baux DHCP"
         L_LEASES_NONE="Aucun bail enregistre pour l'instant."
+        L_LEASE_ACTIVE="actif"
+        L_LEASE_FREE="rendu"
         L_DIG_T="Test de resolution"
         L_DIG_ASK="Nom a resoudre :"
         L_DIG_HINT="La question est posee au serveur local (127.0.0.1)."
@@ -1090,6 +1136,7 @@ load_strings() {
         L_DIAG_T="Diagnostic"
         L_DIAG_HEAD="ETAT DE LA MACHINE"
         L_DIAG_SVC="SERVICES (paquet / etat / demarrage)"
+        L_DIAG_UNITS="Unites systemd"
         L_DIAG_PORTS="PORTS EN ECOUTE"
         L_DIAG_NOPORT="Aucun service n'ecoute sur 53 ou 67."
         L_DIAG_CHECK_DNS="CONTROLE DE LA CONFIGURATION DNS"
@@ -1102,7 +1149,7 @@ load_strings() {
         L_CHECK_T="Verification"
         L_CHECK_RC="Code de retour : %s"
         L_CHECK_NO_BIND="named-checkconf est absent : BIND9 n'est pas installe."
-        L_CHECK_NO_DHCP="dhcpd est absent : ISC DHCP n'est pas installe."
+        L_CHECK_NO_DHCP="kea-dhcp4 est absent : Kea n'est pas installe."
         L_CHECK_NOTHING="Aucun service actif : rien a verifier."
         L_FW_T="Pare-feu"
         L_FW_OPEN="Ouvrir les ports des services actives"
@@ -1149,8 +1196,8 @@ load_strings() {
         L_INSTALL_T="Installation"
         L_INSTALL_OK="Les paquets demandes sont installes."
         L_INSTALL_NOTHING="Rien a installer : tout est deja en place."
-        L_DHCP_MISSING_T="ISC DHCP indisponible"
-        L_DHCP_MISSING_B=$'Le paquet isc-dhcp-server n\'existe pas dans les depots\nde cette distribution : ISC DHCP a atteint sa fin de vie\net a ete retire apres Debian 12.\n\nLa partie DNS reste entierement utilisable.\nPour le DHCP, utilisez Debian 12 ou un serveur Kea.'
+        L_DHCP_MISSING_T="Kea DHCP4 indisponible"
+        L_DHCP_MISSING_B=$'Le paquet kea-dhcp4-server n\'existe pas dans les\ndepots de cette distribution.\n\nLa partie DNS reste entierement utilisable. Pour le DHCP,\nactivez le depot qui fournit Kea, ou desactivez la partie DHCP.'
         L_DERIVE_T="Recalculer"
         L_DERIVE_Q=$'Relire l\'adresse, le masque et la passerelle\nde la machine et recalculer les valeurs deduites ?\n\nLes valeurs saisies a la main seront remplacees.'
         L_DERIVE_OK="Valeurs recalculees depuis le reseau de la machine."
@@ -1158,9 +1205,9 @@ load_strings() {
         L_RESET_Q=$'Remettre tout le formulaire a ses valeurs par defaut ?\n\nLes fichiers deja en place ne sont pas touches.'
         L_RESET_OK="Formulaire remis a zero."
         L_REMOVE_T="Desinstallation"
-        L_REMOVE_Q=$'Supprimer la configuration de BIND9 et d\'ISC DHCP ?\n\nLes services seront arretes et desactives.\nLes sauvegardes sont conservees.'
-        L_REMOVE_PURGE_Q="Purger aussi les paquets bind9 et isc-dhcp-server ?"
-        L_REMOVE_DONE="BIND9 et ISC DHCP ont ete retires de cette machine."
+        L_REMOVE_Q=$'Supprimer la configuration de BIND9 et d\'Kea DHCP4 ?\n\nLes services seront arretes et desactives.\nLes sauvegardes sont conservees.'
+        L_REMOVE_PURGE_Q="Purger aussi les paquets bind9 et kea-dhcp4-server ?"
+        L_REMOVE_DONE="BIND9 et Kea DHCP4 ont ete retires de cette machine."
         L_SAVE_T="Enregistrement"
         L_SAVE_OK="Configuration enregistree dans %s"
         L_SAVE_KO="Impossible d'ecrire la configuration."
@@ -1549,6 +1596,7 @@ MI_DNS_PKG=""; MI_DNS_PKG_ST="off"
 MI_DNS_SVC=""; MI_DNS_SVC_ST="off"
 MI_DNS_BOOT=""; MI_DNS_BOOT_ST="off"
 MI_DHCP_PKG=""; MI_DHCP_PKG_ST="off"
+MI_D2_PKG=""
 MI_DHCP_SVC=""; MI_DHCP_SVC_ST="off"
 MI_DHCP_BOOT=""; MI_DHCP_BOOT_ST="off"
 MI_P53=""; MI_P53_ST="warn"
@@ -1651,7 +1699,7 @@ port_state() {
     [[ -z $proc ]] && proc="?"
     PORT_TXT="$proc"
     case $proc in
-        named|dhcpd) PORT_ST="ok" ;;
+        named|kea-dhcp4) PORT_ST="ok" ;;
         *)           PORT_ST="err" ;;
     esac
 }
@@ -1663,9 +1711,18 @@ count_zones() {
     printf '%s' "$n"
 }
 
+# Le fichier de baux de Kea est un CSV dont la premiere ligne est l'en-tete.
+# Une meme adresse y figure autant de fois qu'elle a change d'etat : seule la
+# derniere ligne fait foi. L'etat 0 designe un bail actif, 1 et 2 un bail rendu
+# ou expire. Compter les lignes donnerait un total plusieurs fois trop grand.
 count_leases() {
     local n=0
-    [[ -r $DHCP_LEASES ]] && n=$(grep -c '^lease ' "$DHCP_LEASES" 2>/dev/null)
+    if [[ -r $KEA_LEASES ]]; then
+        n=$(awk -F, '
+            NR > 1 && NF >= 10 { st[$1] = $10 }
+            END { c = 0; for (a in st) if (st[a] == 0) c++; print c }
+        ' "$KEA_LEASES" 2>/dev/null)
+    fi
     [[ $n =~ ^[0-9]+$ ]] || n=0
     printf '%s' "$n"
 }
@@ -1687,10 +1744,15 @@ collect_state() {
     svc_state "$BIND_UNIT"; MI_DNS_SVC=$SVC_TXT; MI_DNS_SVC_ST=$SVC_ST
     svc_boot  "$BIND_UNIT"; MI_DNS_BOOT=$BOOT_TXT; MI_DNS_BOOT_ST=$BOOT_ST
 
-    if pkg_installed isc-dhcp-server; then
+    if pkg_installed kea-dhcp4-server; then
         MI_DHCP_PKG="$L_V_INSTALLED"; MI_DHCP_PKG_ST="ok"
     else
         MI_DHCP_PKG="$L_V_MISSING"; MI_DHCP_PKG_ST="off"
+    fi
+    if pkg_installed kea-dhcp-ddns-server; then
+        MI_D2_PKG="$L_V_INSTALLED"
+    else
+        MI_D2_PKG="$L_V_MISSING"
     fi
     svc_state "$DHCP_UNIT"; MI_DHCP_SVC=$SVC_TXT; MI_DHCP_SVC_ST=$SVC_ST
     svc_boot  "$DHCP_UNIT"; MI_DHCP_BOOT=$BOOT_TXT; MI_DHCP_BOOT_ST=$BOOT_ST
@@ -3175,8 +3237,19 @@ do_install_dns() {
     do_apt_install $p
 }
 
+# Paquets DHCP : le serveur DHCPv4, plus le demon de mise a jour dynamique
+# quand elle est demandee.
+dhcp_packages() {
+    local pkgs="kea-dhcp4-server"
+    [[ ${VAL[ddns_enable]} == oui ]] && pkg_known kea-dhcp-ddns-server && \
+        pkgs="$pkgs kea-dhcp-ddns-server"
+    printf '%s' "$pkgs"
+}
+
 do_install_dhcp() {
-    do_apt_install isc-dhcp-server
+    local p; p=$(dhcp_packages)
+    # shellcheck disable=SC2086
+    do_apt_install $p
 }
 
 #==============================================================================
@@ -3192,7 +3265,7 @@ do_backup() {
     chmod 700 "$BACKUP_DIR" 2>/dev/null
     local f
     for f in "$BIND_OPTIONS" "$BIND_LOCAL" "$BIND_DIR/named.conf" \
-             "$DHCP_CONF" "$DHCP_DEFAULT" "$DDNS_KEY_FILE" "$CONF_FILE"; do
+             "$KEA_CONF" "$KEA_D2_CONF" "$DDNS_KEY_FILE" "$CONF_FILE"; do
         [[ -f $f ]] && cp -a "$f" "$dst/$(basename "$f")" 2>/dev/null
     done
     if [[ -d $BIND_ZONE_DIR ]]; then
@@ -3481,83 +3554,23 @@ do_check_bind() {
 }
 
 #==============================================================================
-#  20. TACHES : CONFIGURATION D'ISC DHCP
+#  20. TACHES : CONFIGURATION DE KEA DHCP4
+#
+#  La configuration de Kea est du JSON : chaque virgule compte. Les listes sont
+#  donc assemblees dans un tableau puis rendues par json_list(), qui place les
+#  separateurs. Kea accepte les commentaires de style C++, ce qui permet de
+#  marquer les fichiers generes sans casser l'analyse.
 #==============================================================================
 
-do_dhcp_conf() {
-    local dom=${VAL[dhcp_domain]} name mac ip e
-
-    mkdir -p "$(dirname "$DHCP_CONF")" || return 1
-    {
-        printf '%s\n' "$GEN_MARK"
-        printf '# %s\n\n' "$(date '+%F %T')"
-        printf 'option domain-name "%s";\n' "$dom"
-        printf 'option domain-name-servers %s;\n' "$(csv_list "${VAL[dhcp_dns]}")"
-        [[ -n ${VAL[dhcp_ntp]} ]] && printf 'option ntp-servers %s;\n' "$(csv_list "${VAL[dhcp_ntp]}")"
-        printf '\n'
-        printf 'default-lease-time %s;\n' "${VAL[dhcp_lease]}"
-        printf 'max-lease-time %s;\n' "${VAL[dhcp_maxlease]}"
-        printf 'ping-check true;\n'
-        [[ ${VAL[dhcp_auth]} == oui ]] && printf 'authoritative;\n'
-        [[ ${VAL[dhcp_deny]} == oui ]] && printf 'deny unknown-clients;\n'
-        printf '\n'
-
-        if [[ ${VAL[ddns_enable]} == oui ]]; then
-            cat <<EOF
-ddns-update-style interim;
-ddns-updates on;
-update-static-leases on;
-include "$DDNS_KEY_FILE";
-
-zone ${VAL[domain]}. {
-    primary 127.0.0.1;
-    key ${VAL[ddns_key]};
+# json_esc <texte> : echappe ce qui ne peut pas rester tel quel dans une chaine
+json_esc() {
+    local v=$1
+    v=${v//\\/\\\\}
+    v=${v//\"/\\\"}
+    printf '%s' "$v"
 }
 
-zone ${VAL[rev_zone]}. {
-    primary 127.0.0.1;
-    key ${VAL[ddns_key]};
-}
-
-EOF
-        else
-            printf 'ddns-update-style none;\n\n'
-        fi
-
-        printf 'log-facility local7;\n\n'
-
-        printf 'subnet %s netmask %s {\n' "${VAL[dhcp_subnet]}" "${VAL[dhcp_mask]}"
-        printf '    range %s %s;\n' "${VAL[range_start]}" "${VAL[range_end]}"
-        [[ -n ${VAL[dhcp_routers]} ]] && printf '    option routers %s;\n' "$(csv_list "${VAL[dhcp_routers]}")"
-        [[ -n ${VAL[dhcp_bcast]} ]] && printf '    option broadcast-address %s;\n' "${VAL[dhcp_bcast]}"
-        printf '    option subnet-mask %s;\n' "${VAL[dhcp_mask]}"
-        printf '    option domain-name "%s";\n' "$dom"
-        printf '    option domain-name-servers %s;\n' "$(csv_list "${VAL[dhcp_dns]}")"
-        if [[ -n ${VAL[dhcp_next]} ]]; then
-            printf '    next-server %s;\n' "${VAL[dhcp_next]}"
-            [[ -n ${VAL[dhcp_file]} ]] && printf '    filename "%s";\n' "${VAL[dhcp_file]}"
-        fi
-        printf '}\n'
-
-        parse_list "${VAL[reservations]}"
-        if (( ${#LIST_ITEMS[@]} > 0 )); then
-            printf '\n# Reservations\n'
-            for e in "${LIST_ITEMS[@]}"; do
-                IFS='|' read -r name mac ip <<<"$e"
-                [[ -z $name || -z $mac || -z $ip ]] && continue
-                printf 'host %s {\n' "$name"
-                printf '    hardware ethernet %s;\n' "$mac"
-                printf '    fixed-address %s;\n' "$ip"
-                printf '    option host-name "%s";\n' "$name"
-                printf '}\n'
-            done
-        fi
-    } >"$DHCP_CONF" || return 1
-    chmod 644 "$DHCP_CONF"
-    return 0
-}
-
-# csv_list <liste ";"> -> "a, b, c" pour les options DHCP
+# csv_list <liste ";"> -> "a, b, c", format attendu par les options DHCP
 csv_list() {
     local l=${1//;/ } i out=""
     for i in $l; do
@@ -3567,23 +3580,226 @@ csv_list() {
     printf '%s' "$out"
 }
 
-do_dhcp_default() {
+# json_list <indentation> <element...> : imprime les elements separes par des
+# virgules, sans virgule finale.
+json_list() {
+    local ind=$1; shift
+    local n=$# i=1 e
+    for e in "$@"; do
+        if (( i < n )); then
+            printf '%s%s,\n' "$ind" "$e"
+        else
+            printf '%s%s\n' "$ind" "$e"
+        fi
+        i=$(( i + 1 ))
+    done
+}
+
+# Options DHCP annoncees, communes au sous-reseau -> tableau KEA_OPTS
+build_kea_options() {
+    KEA_OPTS=()
+    local v
+    v=$(csv_list "${VAL[dhcp_routers]}")
+    [[ -n $v ]] && KEA_OPTS+=("{ \"name\": \"routers\", \"data\": \"$(json_esc "$v")\" }")
+    v=$(csv_list "${VAL[dhcp_dns]}")
+    [[ -n $v ]] && KEA_OPTS+=("{ \"name\": \"domain-name-servers\", \"data\": \"$(json_esc "$v")\" }")
+    [[ -n ${VAL[dhcp_domain]} ]] && \
+        KEA_OPTS+=("{ \"name\": \"domain-name\", \"data\": \"$(json_esc "${VAL[dhcp_domain]}")\" }")
+    [[ -n ${VAL[dhcp_bcast]} ]] && \
+        KEA_OPTS+=("{ \"name\": \"broadcast-address\", \"data\": \"${VAL[dhcp_bcast]}\" }")
+    v=$(csv_list "${VAL[dhcp_ntp]}")
+    [[ -n $v ]] && KEA_OPTS+=("{ \"name\": \"ntp-servers\", \"data\": \"$(json_esc "$v")\" }")
+}
+
+# Reservations d'adresses -> tableau KEA_RES
+build_kea_reservations() {
+    KEA_RES=()
+    local e name mac ip
+    parse_list "${VAL[reservations]}"
+    for e in "${LIST_ITEMS[@]}"; do
+        IFS='|' read -r name mac ip <<<"$e"
+        [[ -n $name && -n $mac && -n $ip ]] || continue
+        KEA_RES+=("{ \"hw-address\": \"$mac\", \"ip-address\": \"$ip\", \"hostname\": \"$(json_esc "$name")\" }")
+    done
+}
+
+do_kea_conf() {
+    local pfx pool okey
+    pfx=$(mask_to_prefix "${VAL[dhcp_mask]}")
+    pool="${VAL[range_start]} - ${VAL[range_end]}"
+    okey=$(kea_output_key)
+
+    local -a KEA_OPTS KEA_RES
+    build_kea_options
+    build_kea_reservations
+
+    # Servir uniquement les machines reservees se fait en reservant la plage a
+    # la classe integree KNOWN : Kea n'a pas d'equivalent direct de
+    # "deny unknown-clients".
+    local pool_line="{ \"pool\": \"$pool\" }"
+    [[ ${VAL[dhcp_deny]} == oui ]] && \
+        pool_line="{ \"pool\": \"$pool\", \"client-class\": \"KNOWN\" }"
+
+    mkdir -p "$KEA_DIR" || return 1
+    mkdir -p "$(dirname "$KEA_LEASES")" 2>/dev/null
+    mkdir -p "$KEA_LOGDIR" 2>/dev/null
+    chown _kea:_kea "$KEA_LOGDIR" "$(dirname "$KEA_LEASES")" 2>/dev/null
+
     {
-        printf '%s\n' "$GEN_MARK"
-        printf '# %s\n\n' "$(date '+%F %T')"
-        printf 'INTERFACESv4="%s"\n' "${VAL[dhcp_iface]}"
-        printf 'INTERFACESv6=""\n'
-    } >"$DHCP_DEFAULT" || return 1
-    chmod 644 "$DHCP_DEFAULT"
-    # le fichier de baux doit exister avant le premier demarrage
-    mkdir -p "$(dirname "$DHCP_LEASES")"
-    [[ -f $DHCP_LEASES ]] || : >"$DHCP_LEASES"
-    chown root:root "$DHCP_LEASES" 2>/dev/null
+        printf '// %s\n' "${GEN_MARK#\# }"
+        printf '// %s\n' "$(date '+%F %T')"
+        printf '{\n"Dhcp4": {\n'
+
+        printf '    "interfaces-config": {\n'
+        printf '        "interfaces": [ "%s" ]\n' "$(json_esc "${VAL[dhcp_iface]}")"
+        printf '    },\n\n'
+
+        printf '    "control-socket": {\n'
+        printf '        "socket-type": "unix",\n'
+        printf '        "socket-name": "%s"\n' "$KEA_SOCKET"
+        printf '    },\n\n'
+
+        printf '    "lease-database": {\n'
+        printf '        "type": "memfile",\n'
+        printf '        "lfc-interval": 3600,\n'
+        printf '        "name": "%s"\n' "$KEA_LEASES"
+        printf '    },\n\n'
+
+        printf '    "valid-lifetime": %s,\n' "${VAL[dhcp_lease]}"
+        printf '    "max-valid-lifetime": %s,\n' "${VAL[dhcp_maxlease]}"
+        printf '    "renew-timer": %s,\n' $(( ${VAL[dhcp_lease]} / 2 ))
+        printf '    "rebind-timer": %s,\n' $(( ${VAL[dhcp_lease]} * 7 / 8 ))
+        if [[ ${VAL[dhcp_auth]} == oui ]]; then
+            printf '    "authoritative": true,\n'
+        else
+            printf '    "authoritative": false,\n'
+        fi
+        printf '\n'
+
+        if [[ ${VAL[ddns_enable]} == oui ]]; then
+            printf '    "dhcp-ddns": {\n'
+            printf '        "enable-updates": true,\n'
+            printf '        "server-ip": "127.0.0.1",\n'
+            printf '        "server-port": %s\n' "$KEA_D2_PORT"
+            printf '    },\n'
+            printf '    "ddns-send-updates": true,\n'
+            printf '    "ddns-override-client-update": true,\n'
+            printf '    "ddns-replace-client-name": "when-not-present",\n'
+            printf '    "ddns-qualifying-suffix": "%s",\n\n' "$(json_esc "${VAL[domain]}")"
+        else
+            printf '    "dhcp-ddns": { "enable-updates": false },\n\n'
+        fi
+
+        printf '    "subnet4": [\n'
+        printf '        {\n'
+        printf '            "id": 1,\n'
+        printf '            "subnet": "%s/%s",\n' "${VAL[dhcp_subnet]}" "$pfx"
+        printf '            "pools": [ %s ],\n' "$pool_line"
+        if (( ${#KEA_OPTS[@]} > 0 )); then
+            printf '            "option-data": [\n'
+            json_list '                ' "${KEA_OPTS[@]}"
+            printf '            ],\n'
+        fi
+        if [[ -n ${VAL[dhcp_next]} ]]; then
+            printf '            "next-server": "%s",\n' "${VAL[dhcp_next]}"
+            [[ -n ${VAL[dhcp_file]} ]] && \
+                printf '            "boot-file-name": "%s",\n' "$(json_esc "${VAL[dhcp_file]}")"
+        fi
+        printf '            "reservations": [\n'
+        if (( ${#KEA_RES[@]} > 0 )); then
+            json_list '                ' "${KEA_RES[@]}"
+        fi
+        printf '            ]\n'
+        printf '        }\n'
+        printf '    ],\n\n'
+
+        printf '    "loggers": [\n'
+        printf '        {\n'
+        printf '            "name": "kea-dhcp4",\n'
+        printf '            "%s": [\n' "$okey"
+        printf '                {\n'
+        printf '                    "output": "%s/kea-dhcp4.log",\n' "$KEA_LOGDIR"
+        printf '                    "maxsize": 10485760,\n'
+        printf '                    "maxver": 5\n'
+        printf '                }\n'
+        printf '            ],\n'
+        printf '            "severity": "INFO"\n'
+        printf '        }\n'
+        printf '    ]\n'
+        printf '}\n}\n'
+    } >"$KEA_CONF" || return 1
+    chmod 644 "$KEA_CONF"
+    return 0
+}
+
+# Serveur de mise a jour dynamique (kea-dhcp-ddns). Il ne sert que si DDNS est
+# demande : sinon le fichier n'est pas touche.
+do_kea_ddns_conf() {
+    [[ ${VAL[ddns_enable]} == oui ]] || return 0
+    local secret algo okey
+    secret=$(sed -n 's/.*secret[[:space:]]*"\([^"]*\)".*/\1/p' "$DDNS_KEY_FILE" 2>/dev/null | head -n1)
+    if [[ -z $secret ]]; then
+        printf 'Secret introuvable dans %s\n' "$DDNS_KEY_FILE"
+        return 1
+    fi
+    # BIND ecrit "hmac-sha256", Kea attend "HMAC-SHA256"
+    algo=${VAL[ddns_algo]^^}
+    okey=$(kea_output_key)
+
+    local -a fwd=() rev=()
+    if [[ ${VAL[dns_forward]} == oui ]]; then
+        fwd+=("{ \"name\": \"${VAL[domain]}.\", \"key-name\": \"${VAL[ddns_key]}\", \"dns-servers\": [ { \"ip-address\": \"127.0.0.1\" } ] }")
+    fi
+    if [[ ${VAL[dns_reverse]} == oui && -n ${VAL[rev_zone]} ]]; then
+        rev+=("{ \"name\": \"${VAL[rev_zone]}.\", \"key-name\": \"${VAL[ddns_key]}\", \"dns-servers\": [ { \"ip-address\": \"127.0.0.1\" } ] }")
+    fi
+
+    mkdir -p "$KEA_DIR" || return 1
+    {
+        printf '// %s\n' "${GEN_MARK#\# }"
+        printf '// %s\n' "$(date '+%F %T')"
+        printf '{\n"DhcpDdns": {\n'
+        printf '    "ip-address": "127.0.0.1",\n'
+        printf '    "port": %s,\n\n' "$KEA_D2_PORT"
+        printf '    "tsig-keys": [\n'
+        printf '        {\n'
+        printf '            "name": "%s",\n' "$(json_esc "${VAL[ddns_key]}")"
+        printf '            "algorithm": "%s",\n' "$algo"
+        printf '            "secret": "%s"\n' "$(json_esc "$secret")"
+        printf '        }\n'
+        printf '    ],\n\n'
+        printf '    "forward-ddns": {\n'
+        printf '        "ddns-domains": [\n'
+        (( ${#fwd[@]} > 0 )) && json_list '            ' "${fwd[@]}"
+        printf '        ]\n'
+        printf '    },\n'
+        printf '    "reverse-ddns": {\n'
+        printf '        "ddns-domains": [\n'
+        (( ${#rev[@]} > 0 )) && json_list '            ' "${rev[@]}"
+        printf '        ]\n'
+        printf '    },\n\n'
+        printf '    "loggers": [\n'
+        printf '        {\n'
+        printf '            "name": "kea-dhcp-ddns",\n'
+        printf '            "%s": [\n' "$okey"
+        printf '                { "output": "%s/kea-ddns.log", "maxsize": 10485760, "maxver": 5 }\n' "$KEA_LOGDIR"
+        printf '            ],\n'
+        printf '            "severity": "INFO"\n'
+        printf '        }\n'
+        printf '    ]\n'
+        printf '}\n}\n'
+    } >"$KEA_D2_CONF" || return 1
+    chmod 640 "$KEA_D2_CONF"
+    chown root:_kea "$KEA_D2_CONF" 2>/dev/null
     return 0
 }
 
 do_check_dhcp() {
-    dhcpd -t -cf "$DHCP_CONF"
+    kea-dhcp4 -t "$KEA_CONF" || return 1
+    if [[ ${VAL[ddns_enable]} == oui ]] && command -v kea-dhcp-ddns >/dev/null 2>&1; then
+        kea-dhcp-ddns -t "$KEA_D2_CONF" || return 1
+    fi
+    return 0
 }
 
 #==============================================================================
@@ -3666,6 +3882,19 @@ do_services() {
         systemctl restart "$DHCP_UNIT" 2>&1 || rc=1
     else
         systemctl disable --now "$DHCP_UNIT" 2>&1
+    fi
+
+    # kea-dhcp-ddns n'a de sens qu'avec le serveur DHCP et la mise a jour
+    # dynamique : dans tous les autres cas on l'arrete.
+    if [[ ${VAL[dhcp_enable]} == oui && ${VAL[ddns_enable]} == oui ]]; then
+        if [[ ${VAL[boot_start]} == oui ]]; then
+            systemctl enable "$D2_UNIT" 2>&1 || rc=1
+        else
+            systemctl disable "$D2_UNIT" 2>&1
+        fi
+        systemctl restart "$D2_UNIT" 2>&1 || rc=1
+    else
+        systemctl disable --now "$D2_UNIT" 2>&1
     fi
     return $rc
 }
@@ -3769,11 +3998,13 @@ validate_form() {
 job_install() {
     local need_dns=0 need_dhcp=0
     [[ ${VAL[dns_enable]} == oui ]] && ! pkg_installed bind9 && need_dns=1
-    [[ ${VAL[dhcp_enable]} == oui ]] && ! pkg_installed isc-dhcp-server && need_dhcp=1
+    [[ ${VAL[dhcp_enable]} == oui ]] && ! pkg_installed kea-dhcp4-server && need_dhcp=1
+    [[ ${VAL[dhcp_enable]} == oui && ${VAL[ddns_enable]} == oui ]] && \
+        ! pkg_installed kea-dhcp-ddns-server && need_dhcp=1
     if (( need_dns == 0 && need_dhcp == 0 )); then
         return 2      # rien a faire
     fi
-    if (( need_dhcp )) && ! pkg_known isc-dhcp-server; then
+    if (( need_dhcp )) && ! pkg_known kea-dhcp4-server; then
         modal_message "$L_DHCP_MISSING_T" "$L_DHCP_MISSING_B" "$C_ERR"
         return 1
     fi
@@ -3837,9 +4068,9 @@ job_apply() {
     fi
 
     if [[ ${VAL[dhcp_enable]} == oui ]]; then
-        step_run "$L_S_DHCP_CONF" 52 62 - do_dhcp_conf \
+        step_run "$L_S_DHCP_CONF" 52 62 - do_kea_conf \
             || { die_step "$L_E_DHCP_CONF"; return 1; }
-        step_run "$L_S_DHCP_DEF" 62 68 - do_dhcp_default \
+        step_run "$L_S_DHCP_DEF" 62 68 - do_kea_ddns_conf \
             || { die_step "$L_E_DHCP_DEF"; return 1; }
         step_run "$L_S_CHECK_DHCP" 68 76 - do_check_dhcp \
             || { die_step "$L_E_CHECK_DHCP"; return 1; }
@@ -3901,6 +4132,7 @@ job_remove() {
 do_rm_stop() {
     systemctl disable --now "$BIND_UNIT" 2>&1
     systemctl disable --now "$DHCP_UNIT" 2>&1
+    systemctl disable --now "$D2_UNIT" 2>&1
     return 0
 }
 
@@ -3911,7 +4143,7 @@ do_rm_firewall() {
 do_rm_files() {
     rm -f "$BIND_OPTIONS" "$BIND_LOCAL" "$DDNS_KEY_FILE" 2>/dev/null
     rm -rf "$BIND_ZONE_DIR" 2>/dev/null
-    rm -f "$DHCP_CONF" "$DHCP_DEFAULT" 2>/dev/null
+    rm -f "$KEA_CONF" "$KEA_D2_CONF" 2>/dev/null
     printf 'Fichiers de configuration generes supprimes\n'
     return 0
 }
@@ -3919,7 +4151,8 @@ do_rm_files() {
 do_rm_packages() {
     : >"$APT_STATUS"
     apt-get -o APT::Status-Fd=3 -y purge bind9 bind9-utils bind9-dnsutils \
-            bind9-doc dnsutils isc-dhcp-server 3>"$APT_STATUS" 2>&1
+            bind9-doc dnsutils kea-dhcp4-server kea-dhcp-ddns-server \
+            3>"$APT_STATUS" 2>&1
     apt-get -y autoremove --purge 2>&1
     return 0
 }
@@ -3945,7 +4178,7 @@ do_uninstaller() {
         cat <<CONF
 #!/bin/bash
 #==============================================================================
-#  Desinstallation de BIND9 et d'ISC DHCP
+#  Desinstallation de BIND9 et de Kea DHCP4
 #  Genere le $gen_date par manage-dns-dhcp.sh v$SCRIPT_VERSION
 #
 #  Usage : sudo $out [--yes] [--keep-packages] [--help]
@@ -3953,13 +4186,15 @@ do_uninstaller() {
 
 BIND_UNIT='$BIND_UNIT'
 DHCP_UNIT='$DHCP_UNIT'
+D2_UNIT='$D2_UNIT'
 BIND_OPTIONS='$BIND_OPTIONS'
 BIND_LOCAL='$BIND_LOCAL'
 BIND_ZONE_DIR='$BIND_ZONE_DIR'
 BIND_LOGDIR='$BIND_LOGDIR'
 DDNS_KEY_FILE='$DDNS_KEY_FILE'
-DHCP_CONF='$DHCP_CONF'
-DHCP_DEFAULT='$DHCP_DEFAULT'
+KEA_CONF='$KEA_CONF'
+KEA_D2_CONF='$KEA_D2_CONF'
+KEA_LOGDIR='$KEA_LOGDIR'
 CONF_DIR='$CONF_DIR'
 BACKUP_DIR='$BACKUP_DIR'
 # superset volontaire : on ferme aussi 68/udp, qu'une version anterieure du
@@ -3989,14 +4224,14 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
-printf 'Suppression de BIND9 et d ISC DHCP\n'
-printf '  services      : %s, %s\n' "$BIND_UNIT" "$DHCP_UNIT"
-printf '  fichiers      : %s, %s, %s\n' "$BIND_OPTIONS" "$BIND_LOCAL" "$DHCP_CONF"
+printf 'Suppression de BIND9 et de Kea DHCP4\n'
+printf '  services      : %s, %s, %s\n' "$BIND_UNIT" "$DHCP_UNIT" "$D2_UNIT"
+printf '  fichiers      : %s, %s, %s\n' "$BIND_OPTIONS" "$BIND_LOCAL" "$KEA_CONF"
 printf '  zones         : %s\n' "$BIND_ZONE_DIR"
 if (( KEEP )); then
     printf '  paquets       : conserves\n'
 else
-    printf '  paquets       : bind9 et isc-dhcp-server seront purges\n'
+    printf '  paquets       : bind9 et kea-dhcp4-server seront purges\n'
 fi
 printf '  sauvegardes   : %s (conservees)\n' "$BACKUP_DIR"
 
@@ -4013,6 +4248,7 @@ step() { printf '\n== %s\n' "$1"; }
 step 'Arret des services'
 systemctl disable --now "$BIND_UNIT" 2>/dev/null
 systemctl disable --now "$DHCP_UNIT" 2>/dev/null
+systemctl disable --now "$D2_UNIT" 2>/dev/null
 
 step 'Fermeture des ports'
 if command -v ufw >/dev/null 2>&1; then
@@ -4022,19 +4258,19 @@ fi
 step 'Suppression des fichiers generes'
 rm -f "$BIND_OPTIONS" "$BIND_LOCAL" "$DDNS_KEY_FILE"
 rm -rf "$BIND_ZONE_DIR"
-rm -f "$DHCP_CONF" "$DHCP_DEFAULT"
+rm -f "$KEA_CONF" "$KEA_D2_CONF"
 rm -rf "$CONF_DIR"
 
 if (( ! KEEP )); then
     step 'Purge des paquets'
     apt-get -y purge bind9 bind9-utils bind9-dnsutils bind9-doc dnsutils \
-        isc-dhcp-server 2>/dev/null
+        kea-dhcp4-server kea-dhcp-ddns-server 2>/dev/null
     apt-get -y autoremove --purge 2>/dev/null
-    rm -rf "$BIND_LOGDIR"
+    rm -rf "$BIND_LOGDIR" "$KEA_LOGDIR"
 fi
 
 step 'Termine'
-printf 'BIND9 et ISC DHCP ont ete retires de cette machine.\n'
+printf 'BIND9 et Kea DHCP4 ont ete retires de cette machine.\n'
 printf 'Les sauvegardes restent disponibles dans %s\n' "$BACKUP_DIR"
 UNINSTALLER_EOF
     } >"$out" || return 1
@@ -4199,7 +4435,7 @@ reserv_form() {
             modal_message "$L_INVALID_T" "$L_ERR_RES_NET" "$C_ERR"; continue
         fi
         # une adresse reservee prise dans la plage dynamique finit toujours en
-        # conflit : ISC DHCP refuse de servir deux fois la meme adresse
+        # conflit : Kea DHCP4 refuse de servir deux fois la meme adresse
         if valid_ip "${VAL[range_start]}" && valid_ip "${VAL[range_end]}"; then
             local a s en
             a=$(ip_to_int "$ip"); s=$(ip_to_int "${VAL[range_start]}"); en=$(ip_to_int "${VAL[range_end]}")
@@ -4315,16 +4551,46 @@ svc_boot_toggle() {
 }
 
 #---------------------------------------------------------------- baux DHCP
+# Le fichier de baux de Kea est un CSV :
+#   address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,
+#   fqdn_rev,hostname,state,user_context,pool_id
+# La colonne expire est un horodatage Unix, l'etat 0 designe un bail actif.
+# Une adresse peut apparaitre plusieurs fois : seule la derniere ligne compte.
+#
+# La mise en forme de la date est faite par date(1) et non par awk : strftime()
+# est une extension de gawk, absente de mawk, qui est l'awk par defaut de
+# Debian. Tout le programme awk refuserait de se compiler.
 leases_text() {
-    [[ -r $DHCP_LEASES ]] || { printf '%s\n' "$L_LEASES_NONE"; return; }
-    awk '
-        /^lease / { ip=$2; sub(/[{]/,"",ip); mac=""; host=""; ends=""; state="" }
-        /hardware ethernet/ { mac=$3; sub(/;/,"",mac) }
-        /client-hostname/ { host=$2; gsub(/[";]/,"",host) }
-        /^  ends/ { ends=$3 " " $4; sub(/;/,"",ends) }
-        /binding state/ { state=$3; sub(/;/,"",state) }
-        /^}/ { if (ip != "") printf "%-16s %-18s %-16s %-10s %s\n", ip, mac, host, state, ends; ip="" }
-    ' "$DHCP_LEASES" 2>/dev/null | sort -V | awk -v h="$1" 'BEGIN{print h}{print}'
+    [[ -r $KEA_LEASES ]] || { printf '%s\n' "$L_LEASES_NONE"; return; }
+    [[ -n ${1:-} ]] && printf '%s\n' "$1"
+    local ip mac host st exp etat fin
+    while IFS='|' read -r ip mac host st exp; do
+        [[ -n $ip ]] || continue
+        [[ -n $host ]] || host="-"
+        if [[ $st == 0 ]]; then
+            etat=$L_LEASE_ACTIVE
+            fin="-"
+            [[ $exp =~ ^[0-9]+$ ]] && fin=$(date -d "@$exp" '+%F %H:%M' 2>/dev/null || printf '%s' "$exp")
+        else
+            etat=$L_LEASE_FREE
+            fin="-"
+        fi
+        printf '%-16s %-18s %-16s %-10s %s\n' "$ip" "$mac" "$host" "$etat" "$fin"
+    done < <(awk -F, '
+        # "exp" est le nom d une fonction integree : mawk refuse de en faire un
+        # tableau. Le champ est donc stocke sous le nom "fin".
+        NR > 1 && NF >= 10 {
+            ip = $1
+            mac[ip] = $2; host[ip] = $9; st[ip] = $10; fin[ip] = $5
+            if (!(ip in seen)) { order[++n] = ip; seen[ip] = 1 }
+        }
+        END {
+            for (i = 1; i <= n; i++) {
+                ip = order[i]
+                printf "%s|%s|%s|%s|%s\n", ip, mac[ip], host[ip], st[ip], fin[ip]
+            }
+        }
+    ' "$KEA_LEASES" 2>/dev/null)
 }
 
 show_leases() {
@@ -4369,8 +4635,13 @@ diag_text() {
         printf '%-22s : %s\n' "$L_M_FW" "$MI_FW"
         printf '\n%s\n' "$sep"
         printf '%s\n' "$L_DIAG_SVC"
-        printf '%-22s : %s / %s / %s\n' "BIND9 ($BIND_UNIT)" "$MI_DNS_PKG" "$MI_DNS_SVC" "$MI_DNS_BOOT"
-        printf '%-22s : %s / %s / %s\n' "DHCP ($DHCP_UNIT)" "$MI_DHCP_PKG" "$MI_DHCP_SVC" "$MI_DHCP_BOOT"
+        printf '%-22s : %s / %s / %s\n' "BIND9" "$MI_DNS_PKG" "$MI_DNS_SVC" "$MI_DNS_BOOT"
+        printf '%-22s : %s / %s / %s\n' "Kea DHCP4" "$MI_DHCP_PKG" "$MI_DHCP_SVC" "$MI_DHCP_BOOT"
+        if [[ ${VAL[ddns_enable]} == oui ]]; then
+            svc_state "$D2_UNIT"
+            printf '%-22s : %s / %s\n' "kea-dhcp-ddns" "$MI_D2_PKG" "$SVC_TXT"
+        fi
+        printf '%-22s : %s / %s\n' "$L_DIAG_UNITS" "$BIND_UNIT" "$DHCP_UNIT"
         printf '%-22s : %s\n' "$L_M_P53" "$MI_P53"
         printf '%-22s : %s\n' "$L_M_P67" "$MI_P67"
 
@@ -4391,10 +4662,10 @@ diag_text() {
             fi
         fi
 
-        if [[ ${VAL[dhcp_enable]} == oui ]] && command -v dhcpd >/dev/null 2>&1 && [[ -f $DHCP_CONF ]]; then
+        if [[ ${VAL[dhcp_enable]} == oui ]] && command -v kea-dhcp4 >/dev/null 2>&1 && [[ -f $KEA_CONF ]]; then
             printf '\n%s\n' "$sep"
             printf '%s\n' "$L_DIAG_CHECK_DHCP"
-            dhcpd -t -cf "$DHCP_CONF" 2>&1 | tail -n 12
+            kea-dhcp4 -t "$KEA_CONF" 2>&1 | tail -n 12
         fi
 
         if command -v dig >/dev/null 2>&1 && [[ ${VAL[dns_enable]} == oui ]]; then
@@ -4433,7 +4704,7 @@ check_screen() {
         fi
     fi
     if [[ ${VAL[dhcp_enable]} == oui ]]; then
-        if command -v dhcpd >/dev/null 2>&1; then
+        if command -v kea-dhcp4 >/dev/null 2>&1; then
             res=$(do_check_dhcp 2>&1); rc=$?
             out+="$L_DIAG_CHECK_DHCP"$'\n'
             [[ -n $res ]] && out+="$res"$'\n'
@@ -4468,13 +4739,14 @@ restore_menu() {
     modal_confirm "$L_RESTORE_T" "$(printf "$L_RESTORE_Q" "$(basename "$src")")" 1 || return
 
     local f rc=0
-    for f in named.conf.options named.conf.local dhcpd.conf isc-dhcp-server ddns.key; do
+    for f in named.conf.options named.conf.local kea-dhcp4.conf \
+             kea-dhcp-ddns.conf ddns.key; do
         [[ -f $src/$f ]] || continue
         case $f in
             named.conf.options) cp -a "$src/$f" "$BIND_OPTIONS" || rc=1 ;;
             named.conf.local)   cp -a "$src/$f" "$BIND_LOCAL" || rc=1 ;;
-            dhcpd.conf)         cp -a "$src/$f" "$DHCP_CONF" || rc=1 ;;
-            isc-dhcp-server)    cp -a "$src/$f" "$DHCP_DEFAULT" || rc=1 ;;
+            kea-dhcp4.conf)     cp -a "$src/$f" "$KEA_CONF" || rc=1 ;;
+            kea-dhcp-ddns.conf) cp -a "$src/$f" "$KEA_D2_CONF" || rc=1 ;;
             ddns.key)           cp -a "$src/$f" "$DDNS_KEY_FILE" || rc=1 ;;
         esac
     done
@@ -4627,10 +4899,10 @@ apply_report() {
         lines+=("off|$(printf '  %-20s : %s' "BIND9" "$L_V_DISABLED")")
     fi
     if [[ ${VAL[dhcp_enable]} == oui ]]; then
-        lines+=("$MI_DHCP_SVC_ST|$(printf '  %-20s : %s' "ISC DHCP" "$MI_DHCP_SVC")")
+        lines+=("$MI_DHCP_SVC_ST|$(printf '  %-20s : %s' "Kea DHCP4" "$MI_DHCP_SVC")")
         lines+=("|$(printf '  %-20s : %s' "$L_REP_RANGE" "${VAL[range_start]} - ${VAL[range_end]}")")
     else
-        lines+=("off|$(printf '  %-20s : %s' "ISC DHCP" "$L_V_DISABLED")")
+        lines+=("off|$(printf '  %-20s : %s' "Kea DHCP4" "$L_V_DISABLED")")
     fi
     lines+=("|")
     lines+=("|$(printf '  %-20s : %s' "$L_REP_CONF" "$CONF_FILE")")
@@ -4712,7 +4984,7 @@ build_actions() {
         fi
     fi
 
-    if pkg_installed isc-dhcp-server; then
+    if pkg_installed kea-dhcp4-server; then
         if [[ $MI_DHCP_SVC_ST == ok ]]; then
             act_add dhcp_stop "$L_A_DHCP_STOP" "warn"
         else
@@ -4859,7 +5131,7 @@ CLI_TARGET="all"
 
 usage() {
     cat <<EOF
-DNS-DHCP AUTO v$SCRIPT_VERSION - gestion de BIND9 et d'ISC DHCP
+DNS-DHCP AUTO v$SCRIPT_VERSION - gestion de BIND9 et d'Kea DHCP4
 
 Usage : sudo $0 [option]
 
@@ -4930,7 +5202,7 @@ cli_status() {
     printf '%-24s : %s\n' "$L_M_HOST" "$MI_HOST"
     printf '%-24s : %s (%s)\n' "$L_M_IP" "$MI_IP" "$MI_IFACE"
     printf '%-24s : %s / %s / %s\n' "BIND9" "$MI_DNS_PKG" "$MI_DNS_SVC" "$MI_DNS_BOOT"
-    printf '%-24s : %s / %s / %s\n' "ISC DHCP" "$MI_DHCP_PKG" "$MI_DHCP_SVC" "$MI_DHCP_BOOT"
+    printf '%-24s : %s / %s / %s\n' "Kea DHCP4" "$MI_DHCP_PKG" "$MI_DHCP_SVC" "$MI_DHCP_BOOT"
     printf '%-24s : %s / %s\n' "Unites systemd" "$BIND_UNIT" "$DHCP_UNIT"
     printf '%-24s : %s\n' "$L_M_P53" "$MI_P53"
     printf '%-24s : %s\n' "$L_M_P67" "$MI_P67"
@@ -4952,7 +5224,7 @@ run_cli() {
                 printf '%s\n' "$L_DIAG_CHECK_DNS"
                 do_check_bind || rc=1
             fi
-            if [[ ${VAL[dhcp_enable]} == oui ]] && command -v dhcpd >/dev/null 2>&1; then
+            if [[ ${VAL[dhcp_enable]} == oui ]] && command -v kea-dhcp4 >/dev/null 2>&1; then
                 printf '%s\n' "$L_DIAG_CHECK_DHCP"
                 do_check_dhcp || rc=1
             fi
@@ -5234,9 +5506,9 @@ main() {
         exit 1
     fi
 
-    # Debian 13 et suivantes ne fournissent plus isc-dhcp-server : mieux vaut
-    # le dire tout de suite que d'echouer a l'installation.
-    if ! pkg_known isc-dhcp-server && ! pkg_installed isc-dhcp-server; then
+    # Kea est present dans Debian 12 et 13, mais pas sur toutes les images
+    # derivees : mieux vaut le dire tout de suite qu'echouer a l'installation.
+    if ! pkg_known kea-dhcp4-server && ! pkg_installed kea-dhcp4-server; then
         modal_message "$L_DHCP_MISSING_T" "$L_DHCP_MISSING_B" "$C_WARN"
     fi
 

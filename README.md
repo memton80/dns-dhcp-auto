@@ -1,9 +1,9 @@
-# Script de gestion automatique de BIND9 et d'ISC DHCP
+# Script de gestion automatique de BIND9 et de Kea DHCP
 
-## Automatic BIND9 and ISC DHCP Management Script
+## Automatic BIND9 and Kea DHCP Management Script
 
 Un seul fichier Bash, sans aucune dépendance, qui installe **et surtout gère**
-un serveur DNS (BIND9) et un serveur DHCP (ISC DHCP) sur Debian et Ubuntu.
+un serveur DNS (BIND9) et un serveur DHCP (Kea DHCP4) sur Debian et Ubuntu.
 
 Ce n'est pas un simple installateur : la configuration est conservée dans
 `/etc/dns-dhcp-auto/config.conf` et le script sert ensuite de console
@@ -13,6 +13,10 @@ pare-feu, sauvegardes, diagnostic et désinstallation.
 L'interface console est faite maison : ni `whiptail`, ni `dialog`, ni `python`.
 Uniquement `bash`, les outils de base de la distribution, et un Tux animé
 pendant les traitements.
+
+> **Pourquoi Kea et pas ISC DHCP ?** ISC DHCP a atteint sa fin de vie fin 2022
+> et son paquet a disparu des dépôts après Debian 12. Kea est son successeur
+> officiel chez ISC, présent dans Debian 12 **et** 13.
 
 ---
 
@@ -40,12 +44,12 @@ pendant les traitements.
 
 | | |
 |---|---|
-| **Installation** | Installe `bind9`, ses outils et `isc-dhcp-server` en suivant la progression réelle d'`apt` |
+| **Installation** | Installe `bind9`, ses outils, `kea-dhcp4-server` et, si besoin, `kea-dhcp-ddns-server`, en suivant la progression réelle d'`apt` |
 | **Configuration** | Un formulaire complet, replié par sections, couvrant tout ce que les deux services demandent |
 | **Activation / désactivation** | Chacun des deux services s'active ou se coupe indépendamment, au démarrage comme tout de suite |
 | **État permanent** | Panneau de droite : services, démarrage automatique, ports 53 et 67, pare-feu, nombre de zones et de baux |
 | **Actions** | Démarrer, arrêter, redémarrer, recharger les zones, voir les baux, tester une résolution, lire les journaux |
-| **Vérification** | `named-checkconf`, `named-checkzone` et `dhcpd -t` sont lancés avant tout redémarrage |
+| **Vérification** | `named-checkconf`, `named-checkzone` et `kea-dhcp4 -t` sont lancés avant tout redémarrage |
 | **Sauvegardes** | Les fichiers en place sont copiés avant chaque écriture, et restaurables depuis le menu |
 | **Diagnostic** | Un écran unique : état, ports en écoute, contrôles de configuration, résolution locale, dernières erreurs |
 | **Désinstallation** | Depuis le menu, ou par le script autonome `uninstall-dns-dhcp.sh` généré à côté |
@@ -84,23 +88,41 @@ Le numéro de série de chaque zone est au format `AAAAMMJJnn` et **augmente à 
 écriture**, y compris plusieurs fois dans la même journée : les serveurs
 secondaires voient toujours la mise à jour.
 
-### DHCP — ISC DHCP
+### DHCP — Kea DHCP4
 
-| Réglage | Détail |
+La configuration de Kea est du JSON. Le script le génère entièrement, avec les
+virgules au bon endroit, et le fait relire par `kea-dhcp4 -t` avant tout
+redémarrage.
+
+| Réglage | Clé Kea produite |
 |---|---|
-| Étendue | Sous-réseau, masque, plage distribuée |
-| Options | Passerelle, serveurs DNS, domaine, diffusion, serveurs NTP |
-| Baux | Durée par défaut et durée maximale |
-| Comportement | Serveur autoritaire, refus des clients inconnus |
-| Réservations | Adresse fixe par adresse MAC, avec `A` et `PTR` créés dans le DNS |
-| Démarrage PXE | `next-server` et `filename` |
-| Interface | `INTERFACESv4` renseigné dans `/etc/default/isc-dhcp-server` |
+| Interface d'écoute | `interfaces-config.interfaces` |
+| Étendue | `subnet4[].subnet`, en notation CIDR déduite du masque |
+| Plage distribuée | `subnet4[].pools[].pool` |
+| Options annoncées | `option-data` : `routers`, `domain-name-servers`, `domain-name`, `broadcast-address`, `ntp-servers` |
+| Baux | `valid-lifetime`, `max-valid-lifetime`, `renew-timer`, `rebind-timer` |
+| Serveur autoritaire | `authoritative` |
+| Réservations | `subnet4[].reservations[]` : `hw-address`, `ip-address`, `hostname` |
+| Réservations seules | La plage est réservée à la classe intégrée `KNOWN` |
+| Démarrage PXE | `next-server` et `boot-file-name` |
+| Base de baux | `lease-database` en `memfile`, avec compactage horaire (`lfc-interval`) |
+| Pilotage | `control-socket` sur `/run/kea/kea4-ctrl-socket` |
+| Journalisation | `loggers` vers `/var/log/kea/kea-dhcp4.log`, avec rotation |
+
+> **Compatibilité de version.** Kea 2.3.6 a renommé `output_options` en
+> `output-options`. Le script lit la version installée avec `kea-dhcp4 -V` et
+> écrit le nom que cette version connaît : le même fichier de configuration
+> fonctionne sur Debian 12 (Kea 2.2) comme sur Debian 13 (Kea 2.6).
 
 ### Mise à jour dynamique (DDNS)
 
-Le serveur DHCP peut inscrire lui-même les baux dans les zones DNS. Le script
-génère la clé partagée (`tsig-keygen`, algorithme au choix), l'inclut des deux
-côtés et déclare les zones dans `dhcpd.conf`.
+Le démon `kea-dhcp-ddns` inscrit les baux dans les zones DNS. Le script génère
+la clé TSIG partagée (`tsig-keygen`, algorithme au choix), l'inclut côté BIND
+dans `allow-update`, et la recopie dans `kea-dhcp-ddns.conf` — le même secret
+des deux côtés, sans copier-coller manuel.
+
+Les noms d'algorithmes diffèrent entre les deux outils (`hmac-sha256` chez
+BIND, `HMAC-SHA256` chez Kea) : le script fait la conversion.
 
 ### Système
 
@@ -113,16 +135,14 @@ côtés et déclare les zones dans `dhcpd.conf`.
 
 ## Prérequis / Prerequisites
 
-- Debian 12 ou Ubuntu récent, avec `apt-get` et `iproute2`
+- Debian 12, Debian 13 ou Ubuntu récent, avec `apt-get` et `iproute2`
 - Un accès `root` (`sudo`)
 - Un terminal d'au moins **76 × 20** caractères
 - Une adresse IP fixe sur l'interface qui portera les services
 
-> **ISC DHCP et Debian 13.** ISC DHCP a atteint sa fin de vie et le paquet
-> `isc-dhcp-server` a été retiré des dépôts après Debian 12. Le script le
-> détecte au lancement et le dit clairement : la partie DNS reste entièrement
-> utilisable, mais la partie DHCP demande Debian 12 (ou un serveur Kea, hors
-> périmètre de ce script).
+Si `kea-dhcp4-server` n'est pas dans les dépôts de la distribution, le script
+le dit au lancement : la partie DNS reste entièrement utilisable, il suffit de
+désactiver la partie DHCP dans la première section du formulaire.
 
 ---
 
@@ -152,14 +172,14 @@ n'a pas été choisi.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────┐
-│ * modifie          DNS-DHCP AUTO - GESTION BIND9 ET ISC DHCP        v1.0   │
+│ * modifie          DNS-DHCP AUTO - GESTION BIND9 ET KEA DHCP        v1.0   │
 └────────────────────────────────────────────────────────────────────────────┘
 ┌─ Configuration ─────────────────────────┐ ┌─ Machine et services ─────────┐
 │  v SERVICES A GERER                     │ │ Nom d'hote   : srv.exemple.lan │
 │     Activer BIND9 (DNS)      < OUI >    │ │ Adresse IP   : 192.168.1.5     │
-│     Activer ISC DHCP         < OUI >    │ │ Pare-feu     : actif (ufw)     │
+│     Activer Kea DHCP4        < OUI >    │ │ Pare-feu     : actif (ufw)     │
 │     Demarrage automatique    < OUI >    │ │ BIND9        : demarre         │
-│                                         │ │ ISC DHCP     : arrete          │
+│                                         │ │ Kea DHCP4    : arrete          │
 │  v RESEAU DE LA MACHINE                 │ │ Port 53 DNS  : named           │
 │     Interface reseau         < eth0 >   │ │ Zones/baux   : 2 / 7           │
 │     Adresse IP du serveur    192.168.1.5│ └───────────────────────────────┘
@@ -190,8 +210,8 @@ Un `* modifie` s'affiche en haut à gauche dès qu'un champ a changé sans avoir
 été enregistré.
 
 Les sections `DNS` disparaissent entièrement du formulaire si BIND9 est
-désactivé, et les sections `DHCP` si ISC DHCP l'est : l'écran ne montre jamais
-de réglages sans effet.
+désactivé, et les sections `DHCP` si Kea l'est : l'écran ne montre jamais de
+réglages sans effet.
 
 ---
 
@@ -204,23 +224,23 @@ installé et en marche.
 |---|---|
 | Appliquer la configuration | Installe ce qui manque, écrit tous les fichiers, vérifie, redémarre |
 | Installer les paquets manquants | Seulement l'étape `apt` |
-| Vérifier les fichiers de configuration | `named-checkconf`, `named-checkzone`, `dhcpd -t` |
+| Vérifier les fichiers de configuration | `named-checkconf`, `named-checkzone`, `kea-dhcp4 -t` |
 | Diagnostic complet | État, ports, contrôles, résolution locale, journal |
 | Démarrer / Arrêter / Redémarrer BIND9 | `systemctl` sur l'unité détectée (`named` ou `bind9`) |
 | Recharger les zones DNS | `rndc reload`, sans coupure de service |
 | Activer / Désactiver BIND9 au démarrage | `systemctl enable` / `disable` |
-| Démarrer / Arrêter / Redémarrer ISC DHCP | idem pour `isc-dhcp-server` |
-| Voir les baux DHCP | Lecture de `dhcpd.leases`, présentée en tableau |
+| Démarrer / Arrêter / Redémarrer Kea DHCP4 | idem pour `kea-dhcp4-server` |
+| Voir les baux DHCP | Lecture de `kea-leases4.csv`, présentée en tableau |
 | Gérer les enregistrements DNS | Sous-menu d'ajout, modification, suppression |
 | Gérer les réservations DHCP | Sous-menu d'ajout, modification, suppression |
 | Tester une résolution de nom | `dig` sur le serveur local |
-| Journal de BIND9 / du serveur DHCP | `journalctl` filtré sur l'unité |
+| Journal de BIND9 / de Kea | `journalctl` filtré sur l'unité |
 | Pare-feu | Ouvrir, fermer, ou consulter l'état d'`ufw` |
 | Sauvegarder maintenant | Copie horodatée des fichiers en place |
 | Restaurer une sauvegarde | Choix parmi les sauvegardes conservées |
 | Recalculer depuis le réseau | Relit adresse, masque et passerelle de la machine |
 | Remettre les valeurs par défaut | Réinitialise le formulaire, sans toucher aux fichiers |
-| Désinstaller BIND9 et ISC DHCP | Arrêt, suppression des fichiers, purge des paquets au choix |
+| Désinstaller BIND9 et Kea DHCP4 | Arrêt, suppression des fichiers, purge des paquets au choix |
 
 ---
 
@@ -284,17 +304,19 @@ Variables d'environnement reconnues :
 | `/etc/bind/named.conf.local` | Journalisation et déclaration des zones |
 | `/etc/bind/zones/db.<domaine>` | Zone directe |
 | `/etc/bind/zones/db.<zone inverse>` | Zone inverse |
-| `/etc/bind/ddns.key` | Clé de mise à jour dynamique, `640 root:bind` |
-| `/etc/dhcp/dhcpd.conf` | Configuration du serveur DHCP |
-| `/etc/default/isc-dhcp-server` | Interface d'écoute |
+| `/etc/bind/ddns.key` | Clé TSIG de mise à jour dynamique, `640 root:bind` |
+| `/etc/kea/kea-dhcp4.conf` | Configuration de Kea DHCP4 |
+| `/etc/kea/kea-dhcp-ddns.conf` | Configuration du démon DDNS, `640 root:_kea` |
+| `/var/lib/kea/kea-leases4.csv` | Baux distribués |
+| `/var/log/kea/kea-dhcp4.log` | Journal de Kea |
 | `/var/log/named/named.log` | Journal dédié de BIND9 |
 | `/var/log/dns-dhcp-auto.log` | Journal du script, `600 root` |
 | `/var/backups/dns-dhcp-auto/` | Sauvegardes horodatées |
 | `./uninstall-dns-dhcp.sh` | Script de désinstallation autonome |
 
-Tous les fichiers générés commencent par la ligne
-`# --- genere par dns-dhcp-auto ---` : rien de ce qui porte cette marque n'a
-été écrit à la main.
+Tous les fichiers générés commencent par la marque
+`genere par dns-dhcp-auto` — en commentaire `#`, `;` ou `//` selon le format.
+Rien de ce qui la porte n'a été écrit à la main.
 
 ---
 
@@ -315,7 +337,7 @@ Une désinstallation **ne supprime pas** les sauvegardes.
 
 ## Désinstallation / Uninstallation
 
-Depuis l'interface : `a` → `Désinstaller BIND9 et ISC DHCP`. Deux questions
+Depuis l'interface : `a` → `Désinstaller BIND9 et Kea DHCP4`. Deux questions
 sont posées : supprimer la configuration, puis purger ou non les paquets.
 
 Sans l'interface, le script autonome généré à côté :
@@ -323,7 +345,7 @@ Sans l'interface, le script autonome généré à côté :
 ```bash
 sudo ./uninstall-dns-dhcp.sh                  # avec confirmation
 sudo ./uninstall-dns-dhcp.sh --yes            # sans question
-sudo ./uninstall-dns-dhcp.sh --keep-packages  # garde bind9 et isc-dhcp-server
+sudo ./uninstall-dns-dhcp.sh --keep-packages  # garde bind9 et kea
 ```
 
 Il fige les chemins et les ports au moment où il a été généré : il reste
@@ -333,10 +355,10 @@ utilisable même si `manage-dns-dhcp.sh` a disparu de la machine.
 
 ## Dépannage / Troubleshooting
 
-### « Le paquet isc-dhcp-server n'existe pas dans les dépôts »
+### « Le paquet kea-dhcp4-server n'existe pas dans les dépôts »
 
-La distribution est postérieure à Debian 12. Désactivez `Activer ISC DHCP`
-dans la première section : la partie DNS fonctionne normalement.
+La distribution ne fournit pas Kea. Désactivez `Activer Kea DHCP4` dans la
+première section : la partie DNS fonctionne normalement.
 
 ### BIND9 ne démarre pas
 
@@ -350,16 +372,17 @@ La cause la plus fréquente est `systemd-resolved`, qui écoute déjà sur le
 port 53. Le champ `Utiliser ce DNS` du formulaire l'arrête et redirige
 `/etc/resolv.conf` vers le serveur local.
 
-### Le serveur DHCP refuse de démarrer
+### Kea refuse de démarrer
 
 ```bash
-sudo dhcpd -t -cf /etc/dhcp/dhcpd.conf
-sudo systemctl status isc-dhcp-server --no-pager
+sudo kea-dhcp4 -t /etc/kea/kea-dhcp4.conf
+sudo systemctl status kea-dhcp4-server --no-pager
+sudo tail -n 50 /var/log/kea/kea-dhcp4.log
 ```
 
-`dhcpd` exige que la plage distribuée appartienne bien au sous-réseau déclaré
-et que l'interface d'écoute porte une adresse dans ce sous-réseau. Le
-formulaire vérifie déjà le premier point avant d'écrire.
+Kea exige que l'interface d'écoute porte une adresse appartenant au
+sous-réseau déclaré. Le formulaire vérifie déjà que la plage distribuée y
+appartient avant d'écrire.
 
 ### Les clients n'obtiennent pas d'adresse
 
@@ -370,6 +393,18 @@ sudo ufw status verbose                 # 67/udp est-il ouvert ?
 
 Vérifiez également qu'aucun autre serveur DHCP (box, routeur) ne répond sur
 le même réseau.
+
+### Les baux n'apparaissent pas dans le DNS
+
+La mise à jour dynamique demande le démon `kea-dhcp-ddns` :
+
+```bash
+systemctl status kea-dhcp-ddns-server --no-pager
+sudo tail -n 50 /var/log/kea/kea-ddns.log
+```
+
+Vérifiez aussi que la zone accepte les mises à jour : `named.conf.local` doit
+porter `allow-update { key "..." };` et non `allow-update { none; };`.
 
 ### La résolution ne marche que localement
 
