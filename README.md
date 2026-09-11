@@ -1,3 +1,6 @@
+> [!CAUTION]
+> Le script est hors service, il ne fonctionne pas.
+
 # Script de gestion automatique de BIND9 et de Kea DHCP
 
 ## Automatic BIND9 and Kea DHCP Management Script
