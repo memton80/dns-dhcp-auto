@@ -565,6 +565,10 @@ load_strings() {
         L_ERR_LEASE="The default lease exceeds the maximum lease."
         L_ERR_RESERV="Invalid reservation: %s"
         L_ERR_RES_NET="This address does not belong to the served subnet."
+        L_ERR_RES_OUT="Reservation %s: address outside the served subnet."
+        L_ERR_RES_DUPIP="Address %s is reserved twice."
+        L_ERR_RES_DUPMAC="MAC address %s is reserved twice."
+        L_ERR_IFACE_GONE="Interface %s does not exist on this machine."
         L_LIST_ADD="+ Add"
         L_LIST_HELP="Enter edits, a adds, s deletes, Esc closes"
         L_LIST_DEL_T="Delete"
@@ -1012,6 +1016,10 @@ load_strings() {
         L_ERR_LEASE="Le bail par defaut depasse le bail maximum."
         L_ERR_RESERV="Reservation invalide : %s"
         L_ERR_RES_NET="Cette adresse n'appartient pas au sous-reseau desservi."
+        L_ERR_RES_OUT="Reservation %s : adresse hors du sous-reseau desservi."
+        L_ERR_RES_DUPIP="L'adresse %s est reservee deux fois."
+        L_ERR_RES_DUPMAC="L'adresse MAC %s est reservee deux fois."
+        L_ERR_IFACE_GONE="L'interface %s n'existe pas sur cette machine."
         L_LIST_ADD="+ Ajouter"
         L_LIST_HELP="Entree modifie, a ajoute, s supprime, Echap ferme"
         L_LIST_DEL_T="Supprimer"
@@ -3131,7 +3139,10 @@ die_step() {
     # Douze lignes : de quoi montrer a la fois le motif de l'echec et l'etat
     # du chemin mis en cause, que les taches tracent desormais l'un apres
     # l'autre.
-    tail_log=$(tail -n 12 "$STEP_LOG" 2>/dev/null | cut -c1-72)
+    # Replier plutot que couper : la raison d'un refus de Kea ou de named
+    # arrive apres la soixante-douzieme colonne, et "cut" la faisait
+    # disparaitre de la fenetre comme du mode ligne de commande.
+    tail_log=$(tail -n 12 "$STEP_LOG" 2>/dev/null | fold -s -w 72 | tail -n 12)
     log_line "ECHEC : $msg (etape : ${STEP_LABEL:-?}, progression : ${PCT:-0}%)"
     if (( CLI_MODE )); then
         printf '%s\n' "$msg" >&2
@@ -3962,6 +3973,17 @@ do_kea_ddns_conf() {
     return 0
 }
 
+# kea_explain : ne garde de la sortie de Kea que ce qui explique le refus.
+# Kea fait preceder chaque ligne de la date, du niveau, du logger, du numero
+# de processus et d'un identifiant de message : soixante-dix caracteres de
+# prefixe avant le motif reel, que la fenetre d'echec tronquait avant d'y
+# arriver. Les lignes d'information et d'avertissement, elles, ne disent rien
+# de l'echec et repoussaient la vraie cause hors des dernieres lignes lues.
+kea_explain() {
+    sed -e '/^[0-9][0-9-]* [0-9][0-9:.]* \(INFO\|WARN\|DEBUG\)/d' \
+        -e 's/^[0-9][0-9-]* [0-9][0-9:.]* [A-Z]* *\[[^]]*\] *[A-Z0-9_]* *//'
+}
+
 # kea_check_one <binaire> <fichier> : controle de syntaxe explique.
 #
 # "Unable to open file" ne dit ni si le fichier manque, ni s'il est vide, ni
@@ -3979,7 +4001,7 @@ kea_check_one() {
     fi
     out=$("$bin" -t "$conf" 2>&1); rc=$?
     if (( rc != 0 )); then
-        printf '%s\n' "$out"
+        printf '%s\n' "$out" | kea_explain
         # Seul un des deux noms du bloc de journalisation passe selon la
         # version. Si c'est le seul reproche, on echange et on recommence :
         # une detection de version un peu vieille ne bloque plus rien.
@@ -3992,7 +4014,7 @@ kea_check_one() {
         fi
         printf 'Nouvel essai avec l autre nom de bloc de journalisation\n'
         out=$("$bin" -t "$conf" 2>&1); rc=$?
-        (( rc == 0 )) || printf '%s\n' "$out"
+        (( rc == 0 )) || printf '%s\n' "$out" | kea_explain
     fi
     return $rc
 }
@@ -4146,7 +4168,12 @@ validate_form() {
     fi
 
     if [[ ${VAL[dhcp_enable]} == oui ]]; then
-        local -a dh=(dhcp_subnet dhcp_mask range_start range_end dhcp_dns dhcp_domain dhcp_lease dhcp_maxlease)
+        # Les cinq derniers champs partent tels quels dans "option-data",
+        # "next-server" et "boot-file-name" : Kea les analyse et refuse tout le
+        # fichier sur un nom d'hote la ou il attend une adresse.
+        local -a dh=(dhcp_subnet dhcp_mask range_start range_end dhcp_dns dhcp_domain
+                     dhcp_lease dhcp_maxlease dhcp_routers dhcp_ntp dhcp_bcast
+                     dhcp_next dhcp_file)
         for k in "${dh[@]}"; do
             i=$(field_index "$k"); kind=$(field_check_kind "$i")
             if ! validate_value "$kind" "${VAL[$k]}"; then
@@ -4155,6 +4182,13 @@ validate_form() {
         done
         if [[ -z ${VAL[dhcp_iface]} ]]; then
             FERR="$L_ERR_NOIFACE"; FKEY="dhcp_iface"; return 1
+        fi
+        # Kea refuse la configuration entiere quand l'interface nommee n'existe
+        # pas. Une configuration relue peut designer une carte renommee, ou
+        # celle d'une autre machine.
+        if ! list_ifaces | grep -qxF -- "${VAL[dhcp_iface]}"; then
+            FERR="$(printf "$L_ERR_IFACE_GONE" "${VAL[dhcp_iface]}")"
+            FKEY="dhcp_iface"; return 1
         fi
         local net
         net=$(network_of "${VAL[dhcp_subnet]}" "${VAL[dhcp_mask]}")
@@ -4181,13 +4215,29 @@ validate_form() {
         if (( ${VAL[dhcp_lease]} > ${VAL[dhcp_maxlease]} )); then
             FERR="$L_ERR_LEASE"; FKEY="dhcp_maxlease"; return 1
         fi
+        # Le formulaire de saisie controle deja l'appartenance au sous-reseau,
+        # mais une reservation reste en place quand le sous-reseau change
+        # ensuite, et rien n'y empeche deux lignes pour la meme adresse ou la
+        # meme carte. Kea rejette les trois cas, si tard que son message part
+        # dans le journal de l'etape au lieu de designer le champ fautif.
         parse_list "${VAL[reservations]}"
-        local r name mac ip
+        local r name mac ip seen_ip=" " seen_mac=" "
         for r in "${LIST_ITEMS[@]}"; do
             IFS='|' read -r name mac ip <<<"$r"
             if ! valid_mac "$mac" || ! valid_ip "$ip"; then
                 FERR="$(printf "$L_ERR_RESERV" "$name")"; FKEY="reservations"; return 1
             fi
+            if ! ip_in_network "$ip" "${VAL[dhcp_subnet]}" "${VAL[dhcp_mask]}"; then
+                FERR="$(printf "$L_ERR_RES_OUT" "$name")"; FKEY="reservations"; return 1
+            fi
+            if [[ $seen_ip == *" $ip "* ]]; then
+                FERR="$(printf "$L_ERR_RES_DUPIP" "$ip")"; FKEY="reservations"; return 1
+            fi
+            if [[ $seen_mac == *" ${mac,,} "* ]]; then
+                FERR="$(printf "$L_ERR_RES_DUPMAC" "$mac")"; FKEY="reservations"; return 1
+            fi
+            seen_ip="$seen_ip$ip "
+            seen_mac="$seen_mac${mac,,} "
         done
     fi
     return 0
@@ -4829,6 +4879,7 @@ dig_test() {
 #---------------------------------------------------------------- diagnostic
 diag_text() {
     local sep="------------------------------------------------------------"
+    local dhcp_out
     {
         printf '%s\n' "$L_DIAG_HEAD"
         printf '%s\n' "$sep"
@@ -4874,8 +4925,13 @@ diag_text() {
                 printf '%s\n' "$L_CHECK_NO_DHCP"
             elif ! file_ready "$KEA_CONF"; then
                 report_path "$KEA_CONF"
-            elif kea-dhcp4 -t "$KEA_CONF" 2>&1 | tail -n 12; then
+            # "kea-dhcp4 -t | tail" rend le code de tail, toujours nul : le
+            # diagnostic annoncait saine une configuration que l'application
+            # refusait ensuite. On garde le code du controleur.
+            elif dhcp_out=$(kea-dhcp4 -t "$KEA_CONF" 2>&1); then
                 printf '%s\n' "$L_DIAG_OK"
+            else
+                printf '%s\n' "$dhcp_out" | kea_explain | tail -n 12
             fi
         fi
 
