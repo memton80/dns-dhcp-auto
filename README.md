@@ -137,6 +137,22 @@ des deux côtés, sans copier-coller manuel.
 Les noms d'algorithmes diffèrent entre les deux outils (`hmac-sha256` chez
 BIND, `HMAC-SHA256` chez Kea) : le script fait la conversion.
 
+Une zone alimentée par le DHCP n'est plus un fichier que BIND lit : il y écrit.
+Trois choses le lui permettent, et sans elles chaque mise à jour venue de Kea
+est refusée sans que le DHCP s'en plaigne :
+
+- le répertoire des zones passe en `2775 root:bind` et les fichiers en
+  `664 root:bind`, pour que `named` puisse créer le journal `db.<zone>.jnl` ;
+- la dérogation AppArmor `/etc/bind/zones/** rw,` est ajoutée au fichier
+  `/etc/apparmor.d/local/usr.sbin.named` prévu par Debian, dont le profil
+  livré n'ouvre `/etc/bind` qu'en lecture ;
+- avant de réécrire une zone, le script la fige (`rndc freeze`), jette le
+  journal devenu faux et la relâche (`rndc thaw`) : un journal laissé en place
+  à côté d'un fichier remplacé fait refuser le chargement de la zone entière.
+
+Ces trois réglages sont défaits quand la mise à jour dynamique est désactivée
+ou quand le script est désinstallé.
+
 ### Système
 
 - Ouverture de `53/tcp`, `53/udp` et `67/udp` dans `ufw`
@@ -320,6 +336,7 @@ Variables d'environnement reconnues :
 | `/etc/bind/ddns.key` | Clé TSIG de mise à jour dynamique, `640 root:bind` |
 | `/etc/kea/kea-dhcp4.conf` | Configuration de Kea DHCP4 |
 | `/etc/kea/kea-dhcp-ddns.conf` | Configuration du démon DDNS, `640 root:_kea` |
+| `/etc/apparmor.d/local/usr.sbin.named` | Dérogation d'écriture pour les zones dynamiques, seulement si le DDNS est actif |
 | `/var/lib/kea/kea-leases4.csv` | Baux distribués |
 | `/var/log/kea/kea-dhcp4.log` | Journal de Kea |
 | `/var/log/named/named.log` | Journal dédié de BIND9 |
