@@ -569,6 +569,7 @@ load_strings() {
         L_ERR_RES_DUPIP="Address %s is reserved twice."
         L_ERR_RES_DUPMAC="MAC address %s is reserved twice."
         L_ERR_IFACE_GONE="Interface %s does not exist on this machine."
+        L_ERR_DDNS_NODNS="Dynamic updates need the local DNS server: enable BIND9 or turn them off."
         L_LIST_ADD="+ Add"
         L_LIST_HELP="Enter edits, a adds, s deletes, Esc closes"
         L_LIST_DEL_T="Delete"
@@ -737,6 +738,8 @@ load_strings() {
         L_APPLY_T="Apply"
         L_WARN_OPEN_T="Open resolver"
         L_WARN_OPEN_B=$'Recursion is on and any client is allowed to query.\nThis machine becomes an open resolver: it can be used\nto amplify attacks against third parties.\n\nApply anyway?'
+        L_WARN_IFACE_T="Interface outside the subnet"
+        L_WARN_IFACE_B=$'Interface %s carries no address inside %s.\nKea will start without a word and answer no client on\nthis link, unless a relay agent forwards the requests.\n\nApply anyway?'
         L_FORM_KO_T="Incomplete configuration"
         L_SUM_HEAD="Here is what is about to be written:"
         L_SUM_DNS="DNS"
@@ -1020,6 +1023,7 @@ load_strings() {
         L_ERR_RES_DUPIP="L'adresse %s est reservee deux fois."
         L_ERR_RES_DUPMAC="L'adresse MAC %s est reservee deux fois."
         L_ERR_IFACE_GONE="L'interface %s n'existe pas sur cette machine."
+        L_ERR_DDNS_NODNS="La mise a jour dynamique exige le serveur DNS local : activez BIND9 ou desactivez-la."
         L_LIST_ADD="+ Ajouter"
         L_LIST_HELP="Entree modifie, a ajoute, s supprime, Echap ferme"
         L_LIST_DEL_T="Supprimer"
@@ -1188,6 +1192,8 @@ load_strings() {
         L_APPLY_T="Appliquer"
         L_WARN_OPEN_T="Resolveur ouvert"
         L_WARN_OPEN_B=$'La recursion est active et tous les clients sont autorises.\nCette machine devient un resolveur ouvert : elle peut servir\na amplifier des attaques contre des tiers.\n\nAppliquer quand meme ?'
+        L_WARN_IFACE_T="Interface hors du sous-reseau"
+        L_WARN_IFACE_B=$'L\'interface %s ne porte aucune adresse dans %s.\nKea demarrera sans rien dire et ne repondra a aucune machine\nsur ce lien, sauf si un agent relais transmet les demandes.\n\nAppliquer quand meme ?'
         L_FORM_KO_T="Configuration incomplete"
         L_SUM_HEAD="Voici ce qui va etre ecrit :"
         L_SUM_DNS="DNS"
@@ -1595,6 +1601,21 @@ iface_prefix() {
         | awk '{split($4,a,"/"); print a[2]; exit}'
 }
 
+# iface_in_subnet <interface> <reseau> <masque> : vrai si la carte porte au
+# moins une adresse du sous-reseau. Kea ne sert que les liens ou il possede
+# une adresse : ailleurs il demarre, n'affiche aucune erreur, et ne repond a
+# personne. C'est la panne la plus courante et la plus muette.
+iface_in_subnet() {
+    local ifc=$1 net=$2 mask=$3 a
+    [[ -n $ifc ]] || return 1
+    while read -r a; do
+        [[ -n $a ]] || continue
+        ip_in_network "$a" "$net" "$mask" && return 0
+    done < <(ip -4 -o addr show dev "$ifc" scope global 2>/dev/null \
+             | awk '{split($4,a,"/"); print a[1]}')
+    return 1
+}
+
 default_iface() {
     local i
     i=$(ip -4 route show default 2>/dev/null | awk '{print $5; exit}')
@@ -1707,7 +1728,22 @@ port_state() {
     local port=$1 proto=$2 flag line proc=""
     [[ $proto == udp ]] && flag="-lunpH" || flag="-lntpH"
     if command -v ss >/dev/null 2>&1; then
-        line=$(ss $flag 2>/dev/null | awk -v p=":$port" '{ if (index($5, p) && substr($5, length($5)-length(p)+1) == p) print }')
+        # La colonne "Local Address:Port" est la quatrieme, pas la cinquieme :
+        # $5 est l'adresse distante, "0.0.0.0:*", qui ne se termine jamais par
+        # le port cherche. L'indicateur annoncait donc "libre" meme avec named
+        # ou kea-dhcp4 a l'ecoute. On cherche le port dans tous les champs, en
+        # ecartant l'adresse distante, reconnaissable a son "*" final : le
+        # nombre de colonnes varie d'une version de ss a l'autre.
+        line=$(ss $flag 2>/dev/null | awk -v p=":$port" '
+            {
+                for (i = 1; i <= NF; i++) {
+                    f = $i
+                    if (substr(f, length(f)) == "*") continue
+                    if (length(f) > length(p) && substr(f, length(f) - length(p) + 1) == p) {
+                        print; next
+                    }
+                }
+            }')
     else
         PORT_TXT="$L_V_UNKNOWN"; PORT_ST="warn"; return
     fi
@@ -1733,14 +1769,25 @@ count_zones() {
 
 # Le fichier de baux de Kea est un CSV dont la premiere ligne est l'en-tete.
 # Une meme adresse y figure autant de fois qu'elle a change d'etat : seule la
-# derniere ligne fait foi. L'etat 0 designe un bail actif, 1 et 2 un bail rendu
-# ou expire. Compter les lignes donnerait un total plusieurs fois trop grand.
+# derniere ligne fait foi. Compter les lignes donnerait un total plusieurs fois
+# trop grand.
+#
+# Trois colonnes decident qu'un bail est vivant, pas une seule :
+#   $4 duree de validite : Kea ecrit 0 pour marquer un bail supprime, en
+#      gardant l'etat a 0. Ces lignes-la comptaient comme des baux actifs.
+#   $5 date de fin : un bail expire garde lui aussi l'etat 0 jusqu'au menage.
+#   $10 etat : 0 actif, 1 declare, 2 expire ou rendu.
 count_leases() {
-    local n=0
+    local n=0 now
+    now=$(date +%s)
     if [[ -r $KEA_LEASES ]]; then
-        n=$(awk -F, '
-            NR > 1 && NF >= 10 { st[$1] = $10 }
-            END { c = 0; for (a in st) if (st[a] == 0) c++; print c }
+        n=$(awk -F, -v now="$now" '
+            NR > 1 && NF >= 10 { life[$1] = $4 + 0; fin[$1] = $5 + 0; st[$1] = $10 }
+            END {
+                c = 0
+                for (a in st) if (st[a] == 0 && life[a] > 0 && fin[a] > now) c++
+                print c
+            }
         ' "$KEA_LEASES" 2>/dev/null)
     fi
     [[ $n =~ ^[0-9]+$ ]] || n=0
@@ -1919,15 +1966,30 @@ derive_network() {
     set_if_empty dhcp_bcast  "$(broadcast_of "${VAL[server_ip]}" "${VAL[netmask]}")" "$force"
     set_if_empty rev_zone    "$(rev_zone_of "$net" "${VAL[netmask]}")" "$force"
 
-    # plage DHCP par defaut : .100 a .200 du reseau, sans jamais englober
-    # l'adresse du serveur
-    if [[ -n $net ]] && valid_ip "$net"; then
-        local base o
-        IFS=. read -r -a o <<<"$net"
-        base="${o[0]}.${o[1]}.${o[2]}"
-        if [[ $(mask_to_prefix "${VAL[netmask]}") -ge 24 ]]; then
-            set_if_empty range_start "$base.100" "$force"
-            set_if_empty range_end   "$base.200" "$force"
+    # Plage DHCP par defaut. Elle etait fabriquee en recopiant les trois
+    # premiers octets du reseau et en y collant .100 et .200 : sur un /25 dont
+    # le reseau est x.y.z.128, ces deux adresses tombent hors du sous-reseau et
+    # le formulaire refusait ensuite sa propre proposition. Sous /24, aucune
+    # plage n'etait proposee du tout et les deux champs restaient vides.
+    # Le calcul part donc du numero du reseau et ne sort jamais de l'intervalle
+    # utilisable, adresse du serveur exclue.
+    if [[ -n $net ]] && valid_ip "$net" && valid_mask "${VAL[netmask]}"; then
+        local ni bi first last rs re si
+        ni=$(ip_to_int "$net")
+        bi=$(ip_to_int "$(broadcast_of "$net" "${VAL[netmask]}")")
+        if (( bi - ni >= 3 )); then
+            first=$(( ni + 1 )); last=$(( bi - 1 ))
+            rs=$(( ni + 100 )); (( rs < first || rs > last )) && rs=$first
+            re=$(( ni + 200 )); (( re > last || re < rs )) && re=$last
+            si=0
+            valid_ip "${VAL[server_ip]}" && si=$(ip_to_int "${VAL[server_ip]}")
+            if (( si >= rs && si <= re )); then
+                if (( si < last )); then rs=$(( si + 1 )); else re=$(( si - 1 )); fi
+            fi
+            if (( rs <= re )); then
+                set_if_empty range_start "$(int_to_ip "$rs")" "$force"
+                set_if_empty range_end   "$(int_to_ip "$re")" "$force"
+            fi
         fi
     fi
 
@@ -3565,6 +3627,86 @@ EOF
     return 0
 }
 
+# zone_dynamic : vrai quand les zones sont nourries par le DHCP. Dans ce cas
+# named n'est plus seul lecteur de ses fichiers, il y ecrit.
+zone_dynamic() { [[ ${VAL[ddns_enable]} == oui && ${VAL[dns_enable]} == oui ]]; }
+
+# Droits du repertoire et des fichiers de zone. Une zone dynamique oblige named
+# a creer un journal "db.zone.jnl" a cote du fichier et a reecrire le fichier
+# lui-meme : sans droit d'ecriture pour le groupe bind, chaque mise a jour
+# venue de Kea est refusee et le DHCP ne publie jamais rien dans le DNS.
+zone_file_mode() { zone_dynamic && printf '664' || printf '644'; }
+
+# Le bit setgid garde les journaux dans le groupe bind. Il se pose et se retire
+# a part : sur un repertoire, chmod conserve setuid et setgid quand on lui
+# donne un mode numerique, meme complete par un zero de tete.
+zone_dir_perms() {
+    chown root:bind "$BIND_ZONE_DIR" 2>/dev/null
+    if zone_dynamic; then
+        chmod 775 "$BIND_ZONE_DIR" 2>/dev/null
+        chmod g+s "$BIND_ZONE_DIR" 2>/dev/null
+    else
+        chmod 755 "$BIND_ZONE_DIR" 2>/dev/null
+        chmod g-s "$BIND_ZONE_DIR" 2>/dev/null
+    fi
+    return 0
+}
+
+# Le profil AppArmor livre par Debian n'ouvre /etc/bind qu'en lecture : le
+# journal d'une zone dynamique y est refuse avant meme les droits Unix. Debian
+# prevoit un fichier de derogation, inclus par le profil, ou l'on ajoute le
+# strict necessaire.
+AA_PROFILE="/etc/apparmor.d/usr.sbin.named"
+AA_LOCAL="/etc/apparmor.d/local/usr.sbin.named"
+
+do_apparmor_zones() {
+    zone_dynamic || return 0
+    command -v apparmor_parser >/dev/null 2>&1 || return 0
+    [[ -f $AA_PROFILE && -d $(dirname "$AA_LOCAL") ]] || return 0
+    # Sans l'inclusion, ecrire dans le fichier local ne servirait a rien.
+    grep -q 'local/usr.sbin.named' "$AA_PROFILE" 2>/dev/null || return 0
+    if grep -qF "$BIND_ZONE_DIR/** rw," "$AA_LOCAL" 2>/dev/null; then
+        printf 'Derogation AppArmor deja en place pour %s\n' "$BIND_ZONE_DIR"
+    else
+        {
+            printf '%s\n' "$GEN_MARK"
+            printf '%s/ rw,\n' "$BIND_ZONE_DIR"
+            printf '%s/** rw,\n' "$BIND_ZONE_DIR"
+        } >>"$AA_LOCAL" || {
+            printf "Derogation AppArmor impossible a ecrire dans %s\n" "$AA_LOCAL"
+            return 0
+        }
+        printf 'Derogation AppArmor ajoutee pour %s\n' "$BIND_ZONE_DIR"
+    fi
+    # Un profil qui ne se recharge pas n'empeche pas le reste de s'appliquer :
+    # on le signale sans faire echouer l'etape.
+    apparmor_parser -r "$AA_PROFILE" 2>&1 || \
+        printf 'Rechargement du profil AppArmor impossible : redemarrez la machine\n'
+    return 0
+}
+
+# zone_freeze / zone_thaw <zone> : une zone dynamique possede un journal.
+# Remplacer le fichier de zone en laissant le journal fait refuser le
+# chargement par named ("journal out of sync with zone") : la zone disparait
+# alors du service, sans que rien ne l'annonce ici. On fige donc la zone avant
+# de la reecrire, on jette le journal devenu faux, puis on relache.
+zone_freeze() {
+    zone_dynamic || return 0
+    command -v rndc >/dev/null 2>&1 || return 0
+    systemctl is-active --quiet "$BIND_UNIT" 2>/dev/null || return 0
+    rndc freeze "$1" >/dev/null 2>&1 || \
+        printf 'rndc freeze %s a echoue (sans consequence si la zone est neuve)\n' "$1"
+    return 0
+}
+
+zone_thaw() {
+    zone_dynamic || return 0
+    command -v rndc >/dev/null 2>&1 || return 0
+    systemctl is-active --quiet "$BIND_UNIT" 2>/dev/null || return 0
+    rndc thaw "$1" >/dev/null 2>&1 || printf 'rndc thaw %s a echoue\n' "$1"
+    return 0
+}
+
 # Ecrit les deux fichiers de zone a partir de la liste d'enregistrements.
 do_zone_files() {
     local dom=${VAL[domain]} rev=${VAL[rev_zone]} ns=${VAL[ns_name]}
@@ -3574,9 +3716,11 @@ do_zone_files() {
     local serial name type value owner
 
     ensure_dir "$BIND_ZONE_DIR" || return 1
-    local tmp
+    do_apparmor_zones
+    local tmp zmode; zmode=$(zone_file_mode)
 
     if [[ ${VAL[dns_forward]} == oui ]]; then
+        zone_freeze "$dom"
         serial=$(next_serial "$ffile")
         tmp=$(tmp_for "$ffile")
         {
@@ -3623,11 +3767,15 @@ do_zone_files() {
                 done
             fi
             printf '; %s\n' "$GEN_END"
-        } >"$tmp" || { rm -f "$tmp" 2>/dev/null; report_path "$ffile"; return 1; }
-        publish_file "$tmp" "$ffile" 644 root:bind || { report_path "$ffile"; return 1; }
+        } >"$tmp" || { rm -f "$tmp" 2>/dev/null; zone_thaw "$dom"; report_path "$ffile"; return 1; }
+        publish_file "$tmp" "$ffile" "$zmode" root:bind || \
+            { zone_thaw "$dom"; report_path "$ffile"; return 1; }
+        zone_dynamic && rm -f "$ffile.jnl" 2>/dev/null
+        zone_thaw "$dom"
     fi
 
     if [[ ${VAL[dns_reverse]} == oui && -n $rev ]]; then
+        zone_freeze "$rev"
         serial=$(next_serial "$rfile")
         tmp=$(tmp_for "$rfile")
         {
@@ -3668,11 +3816,14 @@ do_zone_files() {
                 done
             fi
             printf '; %s\n' "$GEN_END"
-        } >"$tmp" || { rm -f "$tmp" 2>/dev/null; report_path "$rfile"; return 1; }
-        publish_file "$tmp" "$rfile" 644 root:bind || { report_path "$rfile"; return 1; }
+        } >"$tmp" || { rm -f "$tmp" 2>/dev/null; zone_thaw "$rev"; report_path "$rfile"; return 1; }
+        publish_file "$tmp" "$rfile" "$zmode" root:bind || \
+            { zone_thaw "$rev"; report_path "$rfile"; return 1; }
+        zone_dynamic && rm -f "$rfile.jnl" 2>/dev/null
+        zone_thaw "$rev"
     fi
 
-    chown root:bind "$BIND_ZONE_DIR" 2>/dev/null
+    zone_dir_perms
     return 0
 }
 
@@ -3807,9 +3958,17 @@ do_kea_conf() {
     ensure_dir "$KEA_DIR" || return 1
     ensure_dir "$(dirname "$KEA_LEASES")" || return 1
     ensure_dir "$KEA_LOGDIR" || return 1
-    # Le service tourne sous _kea : baux et journaux doivent lui appartenir.
+    # kea-dhcp4 ouvre sa socket de controle au demarrage et refuse de demarrer
+    # si le repertoire manque. Celui-ci vit dans /run, efface a chaque
+    # extinction : le recreer ici evite un premier demarrage rate. L'unite
+    # systemd sait le recreer elle aussi : on n'arrete pas tout pour lui.
+    ensure_dir "$(dirname "$KEA_SOCKET")" || \
+        printf 'Le service le recreera peut-etre a son demarrage\n'
+    # Le service tourne sous _kea : baux, journaux et socket doivent lui
+    # appartenir.
     if user_exists _kea; then
-        chown _kea:_kea "$KEA_LOGDIR" "$(dirname "$KEA_LEASES")" 2>/dev/null
+        chown _kea:_kea "$KEA_LOGDIR" "$(dirname "$KEA_LEASES")" \
+                        "$(dirname "$KEA_SOCKET")" 2>/dev/null
     fi
 
     tmp=$(tmp_for "$KEA_CONF")
@@ -4098,19 +4257,11 @@ do_services() {
         systemctl disable --now "$BIND_UNIT" 2>&1
     fi
 
-    if [[ ${VAL[dhcp_enable]} == oui ]]; then
-        if [[ ${VAL[boot_start]} == oui ]]; then
-            systemctl enable "$DHCP_UNIT" 2>&1 || rc=1
-        else
-            systemctl disable "$DHCP_UNIT" 2>&1
-        fi
-        systemctl restart "$DHCP_UNIT" 2>&1 || rc=1
-    else
-        systemctl disable --now "$DHCP_UNIT" 2>&1
-    fi
-
     # kea-dhcp-ddns n'a de sens qu'avec le serveur DHCP et la mise a jour
-    # dynamique : dans tous les autres cas on l'arrete.
+    # dynamique : dans tous les autres cas on l'arrete. Il passe avant
+    # kea-dhcp4, qui lui envoie des demandes des le premier bail : demarre
+    # apres, il laissait tomber celles de la periode de recouvrement et les
+    # premieres machines servies n'apparaissaient pas dans le DNS.
     if [[ ${VAL[dhcp_enable]} == oui && ${VAL[ddns_enable]} == oui ]]; then
         if [[ ${VAL[boot_start]} == oui ]]; then
             systemctl enable "$D2_UNIT" 2>&1 || rc=1
@@ -4120,6 +4271,17 @@ do_services() {
         systemctl restart "$D2_UNIT" 2>&1 || rc=1
     else
         systemctl disable --now "$D2_UNIT" 2>&1
+    fi
+
+    if [[ ${VAL[dhcp_enable]} == oui ]]; then
+        if [[ ${VAL[boot_start]} == oui ]]; then
+            systemctl enable "$DHCP_UNIT" 2>&1 || rc=1
+        else
+            systemctl disable "$DHCP_UNIT" 2>&1
+        fi
+        systemctl restart "$DHCP_UNIT" 2>&1 || rc=1
+    else
+        systemctl disable --now "$DHCP_UNIT" 2>&1
     fi
     return $rc
 }
@@ -4139,6 +4301,13 @@ validate_form() {
 
     if [[ ${VAL[dns_enable]} != oui && ${VAL[dhcp_enable]} != oui ]]; then
         FERR="$L_ERR_NOSVC"; FKEY="dns_enable"; return 1
+    fi
+
+    # La cle TSIG partagee entre Kea et BIND n'est ecrite que par l'etape DNS.
+    # Sans le serveur DNS local, la generation de kea-dhcp-ddns.conf echouait
+    # sur un "Secret introuvable" qui ne designait aucun champ du formulaire.
+    if [[ ${VAL[ddns_enable]} == oui && ${VAL[dns_enable]} != oui ]]; then
+        FERR="$L_ERR_DDNS_NODNS"; FKEY="ddns_enable"; return 1
     fi
 
     local -a common=(server_ip netmask domain)
@@ -4224,7 +4393,10 @@ validate_form() {
         local r name mac ip seen_ip=" " seen_mac=" "
         for r in "${LIST_ITEMS[@]}"; do
             IFS='|' read -r name mac ip <<<"$r"
-            if ! valid_mac "$mac" || ! valid_ip "$ip"; then
+            # Le nom compte autant que l'adresse : il part dans "hostname" pour
+            # Kea et en enregistrement A dans la zone. Vide ou fantaisiste, il
+            # faisait disparaitre la reservation sans un mot.
+            if ! valid_host "$name" || ! valid_mac "$mac" || ! valid_ip "$ip"; then
                 FERR="$(printf "$L_ERR_RESERV" "$name")"; FKEY="reservations"; return 1
             fi
             if ! ip_in_network "$ip" "${VAL[dhcp_subnet]}" "${VAL[dhcp_mask]}"; then
@@ -4397,6 +4569,16 @@ do_rm_files() {
     rm -f "$BIND_OPTIONS" "$BIND_LOCAL" "$DDNS_KEY_FILE" 2>/dev/null
     rm -rf "$BIND_ZONE_DIR" 2>/dev/null
     rm -f "$KEA_CONF" "$KEA_D2_CONF" 2>/dev/null
+    # La derogation AppArmor ajoutee pour les zones dynamiques n'a plus d'objet.
+    if [[ -f $AA_LOCAL ]] && grep -qF "$BIND_ZONE_DIR/** rw," "$AA_LOCAL" 2>/dev/null; then
+        local aatmp; aatmp=$(tmp_for "$AA_LOCAL")
+        grep -vxF -e "$GEN_MARK" -e "$BIND_ZONE_DIR/ rw," \
+                  -e "$BIND_ZONE_DIR/** rw," "$AA_LOCAL" >"$aatmp" 2>/dev/null
+        mv -f "$aatmp" "$AA_LOCAL" 2>/dev/null || rm -f "$aatmp" 2>/dev/null
+        command -v apparmor_parser >/dev/null 2>&1 && \
+            apparmor_parser -r "$AA_PROFILE" >/dev/null 2>&1
+        printf 'Derogation AppArmor retiree\n'
+    fi
     printf 'Fichiers de configuration generes supprimes\n'
     return 0
 }
@@ -4448,6 +4630,9 @@ DDNS_KEY_FILE='$DDNS_KEY_FILE'
 KEA_CONF='$KEA_CONF'
 KEA_D2_CONF='$KEA_D2_CONF'
 KEA_LOGDIR='$KEA_LOGDIR'
+AA_PROFILE='$AA_PROFILE'
+AA_LOCAL='$AA_LOCAL'
+GEN_MARK='$GEN_MARK'
 CONF_DIR='$CONF_DIR'
 BACKUP_DIR='$BACKUP_DIR'
 # superset volontaire : on ferme aussi 68/udp, qu'une version anterieure du
@@ -4513,6 +4698,16 @@ rm -f "$BIND_OPTIONS" "$BIND_LOCAL" "$DDNS_KEY_FILE"
 rm -rf "$BIND_ZONE_DIR"
 rm -f "$KEA_CONF" "$KEA_D2_CONF"
 rm -rf "$CONF_DIR"
+
+# Derogation AppArmor posee pour les journaux des zones dynamiques
+if [[ -f $AA_LOCAL ]] && grep -qF "$BIND_ZONE_DIR/** rw," "$AA_LOCAL" 2>/dev/null; then
+    tmp="$AA_LOCAL.uninst.$$"
+    grep -vxF -e "$GEN_MARK" -e "$BIND_ZONE_DIR/ rw," \
+              -e "$BIND_ZONE_DIR/** rw," "$AA_LOCAL" >"$tmp" 2>/dev/null
+    mv -f "$tmp" "$AA_LOCAL" 2>/dev/null || rm -f "$tmp"
+    command -v apparmor_parser >/dev/null 2>&1 && \
+        apparmor_parser -r "$AA_PROFILE" >/dev/null 2>&1
+fi
 
 if (( ! KEEP )); then
     step 'Purge des paquets'
@@ -4816,17 +5011,22 @@ svc_boot_toggle() {
 leases_text() {
     [[ -r $KEA_LEASES ]] || { printf '%s\n' "$L_LEASES_NONE"; return; }
     [[ -n ${1:-} ]] && printf '%s\n' "$1"
-    local ip mac host st exp etat fin
-    while IFS='|' read -r ip mac host st exp; do
+    local ip mac host st exp life etat fin now
+    now=$(date +%s)
+    while IFS='|' read -r ip mac host st exp life; do
         [[ -n $ip ]] || continue
         [[ -n $host ]] || host="-"
-        if [[ $st == 0 ]]; then
+        # Meme regle que count_leases : l'etat seul ne suffit pas. Kea marque un
+        # bail supprime en reecrivant la ligne avec une duree de validite nulle,
+        # et un bail expire garde l'etat 0 jusqu'au prochain menage. Les deux
+        # s'affichaient comme des baux en cours, avec une date de fin passee.
+        fin="-"
+        if [[ $st == 0 && $life =~ ^[0-9]+$ ]] && (( life > 0 )) && \
+           [[ $exp =~ ^[0-9]+$ ]] && (( exp > now )); then
             etat=$L_LEASE_ACTIVE
-            fin="-"
-            [[ $exp =~ ^[0-9]+$ ]] && fin=$(date -d "@$exp" '+%F %H:%M' 2>/dev/null || printf '%s' "$exp")
+            fin=$(date -d "@$exp" '+%F %H:%M' 2>/dev/null || printf '%s' "$exp")
         else
             etat=$L_LEASE_FREE
-            fin="-"
         fi
         printf '%-16s %-18s %-16s %-10s %s\n' "$ip" "$mac" "$host" "$etat" "$fin"
     done < <(awk -F, '
@@ -4834,13 +5034,13 @@ leases_text() {
         # tableau. Le champ est donc stocke sous le nom "fin".
         NR > 1 && NF >= 10 {
             ip = $1
-            mac[ip] = $2; host[ip] = $9; st[ip] = $10; fin[ip] = $5
+            mac[ip] = $2; host[ip] = $9; st[ip] = $10; fin[ip] = $5; life[ip] = $4
             if (!(ip in seen)) { order[++n] = ip; seen[ip] = 1 }
         }
         END {
             for (i = 1; i <= n; i++) {
                 ip = order[i]
-                printf "%s|%s|%s|%s|%s\n", ip, mac[ip], host[ip], st[ip], fin[ip]
+                printf "%s|%s|%s|%s|%s|%s\n", ip, mac[ip], host[ip], st[ip], fin[ip], life[ip]
             }
         }
     ' "$KEA_LEASES" 2>/dev/null)
@@ -5135,6 +5335,18 @@ action_apply() {
        [[ " ${VAL[dns_allow_query]//;/ } " == *" any "* ]]; then
         modal_confirm "$L_WARN_OPEN_T" "$L_WARN_OPEN_B" 1 || {
             select_field_row dns_allow_query
+            return 1
+        }
+    fi
+    # Kea ne sert que les liens ou il porte une adresse. Sur une carte etrangere
+    # au sous-reseau, il demarre, n'ecrit aucune erreur, et ne repond a aucune
+    # machine : la panne la plus courante et la plus silencieuse.
+    if [[ ${VAL[dhcp_enable]} == oui ]] && \
+       ! iface_in_subnet "${VAL[dhcp_iface]}" "${VAL[dhcp_subnet]}" "${VAL[dhcp_mask]}"; then
+        modal_confirm "$L_WARN_IFACE_T" \
+            "$(printf "$L_WARN_IFACE_B" "${VAL[dhcp_iface]}" \
+               "${VAL[dhcp_subnet]}/${VAL[dhcp_mask]}")" 1 || {
+            select_field_row dhcp_iface
             return 1
         }
     fi
